@@ -3,8 +3,7 @@ services:
   tidybooks:  
     build: .
     container_name: tidybooks  
-    ports:
-      - "8502:8501" 
+    network_mode: host
     volumes:
       - /volume1/Zack/media/downloads/Audiobooks - MAM - Seeding:/downloads:ro
       - /volume1/Zack/media/audiobooks:/audiobooks:rw
