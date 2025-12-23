@@ -15,6 +15,10 @@ LIBRARY_DIR = "/audiobooks"
 DATA_DIR = "/app/data"
 HISTORY_FILE = os.path.join(DATA_DIR, "processed_log.json")
 CACHE_FILE = os.path.join(DATA_DIR, "library_map_cache.json")
+
+# API ENDPOINTS
+AUDNEXUS_API = "https://api.audnexus.com/books"
+ITUNES_API = "https://itunes.apple.com/search"
 GOOGLE_BOOKS_API = "https://www.googleapis.com/books/v1/volumes"
 
 os.makedirs(DATA_DIR, exist_ok=True)
@@ -28,8 +32,8 @@ for key in default_keys:
 if 'exp_path' not in st.session_state: st.session_state['exp_path'] = DOWNLOAD_DIR
 if 'exp_root' not in st.session_state: st.session_state['exp_root'] = DOWNLOAD_DIR
 if 'sync_selection' not in st.session_state: st.session_state['sync_selection'] = None
-# Stores the currently selected item data regardless of which tab it came from
 if 'current_selection_data' not in st.session_state: st.session_state['current_selection_data'] = None
+if 'search_provider' not in st.session_state: st.session_state['search_provider'] = "Audible"
 
 # --- Persistence ---
 def load_json(filepath, default=None):
@@ -145,7 +149,6 @@ def get_candidates_with_status():
                         status = 1
                     break
         
-        # New Status Icons for separate tabs
         status_icon = "⚪"
         if status == 3: status_icon = "✅"
         elif status == 2: status_icon = "✅"
@@ -158,41 +161,88 @@ def get_candidates_with_status():
             "State": status_icon, 
             "match_path": match_path,
         })
-
     return final_list
 
-def fetch_metadata(query):
+# --- MULTI-SOURCE SEARCH ENGINE ---
+def fetch_audnexus(query):
     try:
-        params = {"q": query, "maxResults": 10, "langRestrict": "en"}
-        r = requests.get(GOOGLE_BOOKS_API, params=params, timeout=10)
-        r.raise_for_status() 
+        r = requests.get(AUDNEXUS_API, params={'q': query}, timeout=10)
+        r.raise_for_status()
+        data = r.json()
+        results = []
+        for b in data:
+            results.append({
+                "title": b.get('title'),
+                "authors": ", ".join(b.get('authors', [])),
+                "narrators": ", ".join(b.get('narrators', [])),
+                "seriesPrimary": b.get('seriesPrimary', ''),
+                "seriesPrimarySequence": b.get('seriesPrimarySequence', ''),
+                "summary": b.get('summary', ''),
+                "image": b.get('image', ''),
+                "releaseDate": b.get('releaseDate', ''),
+                "source": "Audible"
+            })
+        return results
+    except Exception as e:
+        st.error(f"Audible Error: {e}")
+        return []
+
+def fetch_itunes(query):
+    try:
+        r = requests.get(ITUNES_API, params={'term': query, 'media': 'audiobook', 'limit': 10}, timeout=10)
+        r.raise_for_status()
+        data = r.json()
+        results = []
+        for item in data.get('results', []):
+            img = item.get('artworkUrl100', '').replace('100x100', '600x600')
+            results.append({
+                "title": item.get('collectionName'),
+                "authors": item.get('artistName'),
+                "narrators": "",
+                "seriesPrimary": "",
+                "seriesPrimarySequence": "",
+                "summary": item.get('description', ''),
+                "image": img,
+                "releaseDate": item.get('releaseDate', ''),
+                "source": "Apple"
+            })
+        return results
+    except Exception as e:
+        st.error(f"Apple Error: {e}")
+        return []
+
+def fetch_google(query):
+    try:
+        r = requests.get(GOOGLE_BOOKS_API, params={"q": query, "maxResults": 10, "langRestrict": "en"}, timeout=10)
+        r.raise_for_status()
         data = r.json()
         results = []
         for item in data.get('items', []):
             info = item.get('volumeInfo', {})
-            img_links = info.get('imageLinks', {})
-            img = img_links.get('thumbnail', '') or img_links.get('smallThumbnail', '')
-            img = img.replace('http:', 'https:')
-
+            img = info.get('imageLinks', {}).get('thumbnail', '').replace('http:', 'https:')
             auth_list = info.get('authors', [])
-            primary_author = auth_list[0] if auth_list else ""
-            possible_narrators = ", ".join(auth_list[1:]) if len(auth_list) > 1 else ""
-
             results.append({
                 "title": info.get('title', ''),
-                "authors": primary_author,
-                "narrators": possible_narrators, 
-                "seriesPrimary": "", 
+                "authors": auth_list[0] if auth_list else "",
+                "narrators": ", ".join(auth_list[1:]) if len(auth_list) > 1 else "",
+                "seriesPrimary": "",
                 "seriesPrimarySequence": "",
                 "summary": info.get('description', ''),
                 "image": img,
-                "releaseDate": info.get('publishedDate', '')
+                "releaseDate": info.get('publishedDate', ''),
+                "source": "Google"
             })
         return results
     except Exception as e:
-        st.error(f"❌ Connection Error: {e}")
+        st.error(f"Google Error: {e}")
         return []
 
+def fetch_metadata_router(query, provider):
+    if provider == "Audible": return fetch_audnexus(query)
+    elif provider == "Apple Books": return fetch_itunes(query)
+    else: return fetch_google(query)
+
+# --- FILE OPERATIONS ---
 def tag_file(file_path, author, title, series, desc, cover_url, year, track_num, total_tracks):
     ext = os.path.splitext(file_path)[1].lower()
     try:
@@ -223,7 +273,6 @@ def tag_file(file_path, author, title, series, desc, cover_url, year, track_num,
 def process_selection(source_data, author, title, series, series_part, desc, cover_url, narrator, publish_year):
     mode = "COPY"
     working_source_path = source_data['path']
-    # If messy copy exists (status 1), we FIX (Move) instead of Copy
     if source_data['status_code'] == 1 and source_data['match_path']:
         mode = "FIX"
         working_source_path = source_data['match_path']
@@ -296,7 +345,7 @@ if st.sidebar.button("📉 Update Library Map"):
     st.success("Library updated!")
     st.rerun()
 
-# --- FILE EXPLORER with SYNC ---
+# --- FILE EXPLORER with MANUAL IMPORT ---
 st.sidebar.markdown("---")
 with st.sidebar.expander("📂 File System Explorer", expanded=False):
     root_options = {"Downloads": DOWNLOAD_DIR, "Audiobooks": LIBRARY_DIR}
@@ -309,11 +358,38 @@ with st.sidebar.expander("📂 File System Explorer", expanded=False):
     current_path = st.session_state['exp_path']
     st.caption(f"📍 `{current_path}`")
 
+    # Navigation Up
     if current_path != new_root:
         if st.button("⬆️ Up Level"):
             st.session_state['exp_path'] = os.path.dirname(current_path)
             st.rerun()
-    
+            
+    # --- MANUAL IMPORT BUTTON ---
+    # Only show if we are deep inside the Library (not at root)
+    if selected_root_label == "Audiobooks" and current_path != LIBRARY_DIR:
+        st.markdown("#### 🛠️ Manual Actions")
+        if st.button("✅ Force Mark as 'Imported'"):
+            # Create minimal metadata.json to satisfy the "Green Check" logic
+            folder_name = os.path.basename(current_path)
+            meta_path = os.path.join(current_path, "metadata.json")
+            
+            minimal_meta = {
+                "title": folder_name,
+                "authors": ["Manual Import"],
+                "description": "Manually marked as imported."
+            }
+            
+            # Write file
+            with open(meta_path, 'w') as f:
+                json.dump(minimal_meta, f, indent=4)
+                
+            st.success(f"Marked '{folder_name}' as imported!")
+            # Trigger Library Rescan to update main list
+            scan_library_now()
+            st.cache_data.clear()
+            time.sleep(1)
+            st.rerun()
+
     try:
         items = sorted(os.listdir(current_path))
         dirs = [i for i in items if os.path.isdir(os.path.join(current_path, i))]
@@ -336,31 +412,21 @@ with st.sidebar.expander("📂 File System Explorer", expanded=False):
 # --- MAIN PAGE ---
 col1, col2 = st.columns([1, 2])
 
-# Load Items
 all_items = get_candidates_with_status()
-
-# Separation Logic
-# Status 0 = New/Untidy
-# Status 1,2,3 = Imported/Existing
 new_items = [x for x in all_items if x['status_code'] == 0]
 existing_items = [x for x in all_items if x['status_code'] > 0]
 
-# --- SYNC LOGIC (Pre-Filter) ---
-# If Explorer was clicked, we try to find that path in EITHER list
 if st.session_state['sync_selection']:
     sync_target = st.session_state['sync_selection']
-    # Check if this item exists in all_items
     matching = [x for x in all_items if x['path'] == sync_target or sync_target.startswith(x['path'])]
     if matching:
-        target_item = matching[0]
-        st.session_state['current_selection_data'] = target_item
-        st.toast(f"Jumped to: {target_item['name']}")
-        st.session_state['sync_selection'] = None # Clear trigger
+        st.session_state['current_selection_data'] = matching[0]
+        st.toast(f"Jumped to: {matching[0]['name']}")
+        st.session_state['sync_selection'] = None
 
 with col1:
     tab_new, tab_exist = st.tabs(["🆕 Untidy Queue", "📚 Already Imported"])
     
-    # --- TAB 1: NEW ITEMS ---
     with tab_new:
         if not new_items:
             st.info("Nothing new to import!")
@@ -371,7 +437,7 @@ with col1:
                 column_config={"name": st.column_config.TextColumn("Folder Name")},
                 use_container_width=True,
                 hide_index=True,
-                height=500, # Fixed height so it doesn't collapse
+                height=500,
                 on_select="rerun",
                 selection_mode="single-row",
                 key="grid_new"
@@ -379,7 +445,6 @@ with col1:
             if sel_new.selection.rows:
                 st.session_state['current_selection_data'] = new_items[sel_new.selection.rows[0]]
 
-    # --- TAB 2: EXISTING ITEMS ---
     with tab_exist:
         if not existing_items:
             st.info("No imported items found yet.")
@@ -387,10 +452,7 @@ with col1:
             df_exist = pd.DataFrame(existing_items)
             sel_exist = st.dataframe(
                 df_exist[['State', 'name']],
-                column_config={
-                    "State": st.column_config.TextColumn("State", width="small"),
-                    "name": st.column_config.TextColumn("Folder Name")
-                },
+                column_config={"State": st.column_config.TextColumn("State", width="small")},
                 use_container_width=True,
                 hide_index=True,
                 height=500,
@@ -409,14 +471,19 @@ with col2:
         st.subheader("✏️ Editor")
         st.caption(f"Path: `{selected_item['name']}`")
         
-        # Helper to clear selection
         if st.button("❌ Close Selection"):
             st.session_state['current_selection_data'] = None
             st.rerun()
+            
+        c_src, c_bar, c_btn = st.columns([1, 2, 1])
+        with c_src:
+            provider = st.selectbox("Source", ["Audible", "Apple Books", "Google Books"], key='search_provider')
+        with c_bar:
+            clean_q = clean_search_query(selected_item['name'])
+            q = st.text_input("Search", value=clean_q, label_visibility="collapsed")
+        with c_btn:
+            do_search = st.button("Search")
 
-        clean_q = clean_search_query(selected_item['name'])
-        q = st.text_input("Search", value=clean_q)
-        
         def update_form_state():
             if 'result_selector' in st.session_state and 'search_results' in st.session_state:
                 opts = {f"{b.get('authors')} - {b.get('title')}": b for b in st.session_state['search_results']}
@@ -433,15 +500,15 @@ with col2:
                     st.session_state['form_desc'] = data.get('summary', '')
                     st.session_state['form_img'] = data.get('image', '')
 
-        if st.button("Search"):
-            with st.spinner("Searching Google Books..."):
-                res = fetch_metadata(q)
+        if do_search:
+            with st.spinner(f"Searching {provider}..."):
+                res = fetch_metadata_router(q, provider)
                 if res:
                     st.session_state['search_results'] = res
                     first = f"{res[0].get('authors')} - {res[0].get('title')}"
                     st.session_state['result_selector'] = first
                     update_form_state()
-                else: st.warning("No matches found.")
+                else: st.warning(f"No matches on {provider}.")
 
         if 'search_results' in st.session_state:
             opts = [f"{b.get('authors')} - {b.get('title')}" for b in st.session_state['search_results']]
