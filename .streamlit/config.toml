@@ -1,0 +1,11 @@
+[theme]
+primaryColor = "#00ff9d"       # Bright Green Accents
+backgroundColor = "#0e1117"    # Dark Background
+secondaryBackgroundColor = "#262730" # Darker Grey for sidebars/inputs
+textColor = "#fafafa"          # White text
+font = "sans serif"
+
+[server]
+headless = true
+address = "0.0.0.0"
+port = 8501
