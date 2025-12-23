@@ -13,12 +13,11 @@ from watchdog.events import FileSystemEventHandler
 # --- Configuration ---
 DOWNLOAD_DIR = "/downloads"
 LIBRARY_DIR = "/audiobooks"
-DATA_DIR = "/app/data" # Persist data here
+DATA_DIR = "/app/data"
 HISTORY_FILE = os.path.join(DATA_DIR, "processed_log.json")
 CACHE_FILE = os.path.join(DATA_DIR, "library_cache.json")
 AUDNEXUS_API = "https://api.audnexus.com/books"
 
-# Ensure data directory exists
 os.makedirs(DATA_DIR, exist_ok=True)
 
 st.set_page_config(page_title="TidyBooks", layout="wide", page_icon="📚")
@@ -27,30 +26,29 @@ st.set_page_config(page_title="TidyBooks", layout="wide", page_icon="📚")
 def load_json(filepath, default=[]):
     if os.path.exists(filepath):
         try:
-            with open(filepath, 'r') as f:
-                return json.load(f)
+            with open(filepath, 'r') as f: return json.load(f)
         except: pass
     return default
 
 def save_json(filepath, data):
-    with open(filepath, 'w') as f:
-        json.dump(data, f)
+    with open(filepath, 'w') as f: json.dump(data, f)
 
 def get_library_folders(force_refresh=False):
-    """
-    Cached check of the library folder. 
-    Only scans disk if cache is missing or force_refresh is True.
-    """
     if not force_refresh:
         cached = load_json(CACHE_FILE, None)
-        if cached is not None:
-            return cached
+        if cached is not None: return cached
             
-    # Do the heavy lifting (Disk Scan)
     try:
-        library_folders = [f for f in os.listdir(LIBRARY_DIR) if os.path.isdir(os.path.join(LIBRARY_DIR, f))]
-        save_json(CACHE_FILE, library_folders)
-        return library_folders
+        # We only cache the folder names in the library root
+        library_folders = set()
+        for root, dirs, files in os.walk(LIBRARY_DIR):
+             for d in dirs:
+                 library_folders.add(d)
+        
+        # Convert to list for JSON serialization
+        final_list = list(library_folders)
+        save_json(CACHE_FILE, final_list)
+        return final_list
     except:
         return []
 
@@ -61,72 +59,66 @@ def sanitize_filename(name):
     return re.sub(r'[<>:"|?*]', '', clean).strip()
 
 def get_candidates(force_refresh=False):
+    """
+    RECURSIVE SCANNER:
+    Walks through the entire download directory.
+    If a folder contains audio files, it is considered a Book Candidate.
+    """
     history = load_json(HISTORY_FILE, [])
     candidates = []
     
     if not os.path.exists(DOWNLOAD_DIR):
         return []
 
-    # Use Cached Library list for speed
     library_folders = get_library_folders(force_refresh)
 
-    # Scan Download Directory (This is usually small, so we scan it live)
-    for item in os.listdir(DOWNLOAD_DIR):
-        full_path = os.path.join(DOWNLOAD_DIR, item)
-        is_dir = os.path.isdir(full_path)
+    # Walk the tree top-down
+    for root, dirs, files in os.walk(DOWNLOAD_DIR):
+        # Check if this specific folder has audio files
+        audio_files_in_folder = [f for f in files if f.lower().endswith(('.mp3', '.m4b', '.m4a', '.flac'))]
         
-        # Quick filter for audio content
-        has_audio = False
-        if is_dir:
-            # Shallow check is faster than os.walk for simple detection
-            try:
-                if any(f.lower().endswith(('.mp3', '.m4b', '.m4a', '.flac')) for f in os.listdir(full_path)):
-                    has_audio = True
-                # Deep check only if shallow failed
-                if not has_audio:
-                    for root, _, files in os.walk(full_path):
-                        if any(f.lower().endswith(('.mp3', '.m4b', '.m4a', '.flac')) for f in files):
-                            has_audio = True
-                            break
-            except: pass
-        elif item.lower().endswith(('.mp3', '.m4b', '.m4a', '.flac')):
-            has_audio = True
-
-        if has_audio:
-            status = 0
-            display_prefix = ""
-            match_path = None
+        if audio_files_in_folder:
+            # We found a folder that actually contains music/books!
+            full_path = root
+            folder_name = os.path.basename(root)
             
-            # 1. Check History (Green)
+            # Skip if this specific path is in history
             if full_path in history:
                 status = 2
                 display_prefix = "✅ "
-            
-            # 2. Check Library (Yellow) - uses Cache
-            elif item in library_folders:
-                status = 1
-                display_prefix = "🟨 "
-                match_path = os.path.join(LIBRARY_DIR, item)
+            else:
+                # Check duplication against library cache
+                # We check if 'folder_name' exists anywhere in the library cache
+                status = 0
+                display_prefix = ""
+                match_path = None
 
+                if folder_name in library_folders:
+                    status = 1
+                    display_prefix = "🟨 "
+                    match_path = os.path.join(LIBRARY_DIR, folder_name) # Approximation
+            
             candidates.append({
-                "label": f"{display_prefix}{item}",
+                "label": f"{display_prefix}{folder_name}",
                 "path": full_path,
-                "type": "dir" if is_dir else "file",
+                "type": "dir",
                 "status": status,
                 "match_path": match_path,
-                "name": item
+                "name": folder_name
             })
 
+    # Sort: Status 0 (New) -> Status 1 (Yellow) -> Status 2 (Green)
     return sorted(candidates, key=lambda x: (x['status'], x['name']))
 
 def fetch_metadata(query):
     try:
+        # Timeout added to prevent hanging
         params = {'q': query}
-        r = requests.get(AUDNEXUS_API, params=params)
+        r = requests.get(AUDNEXUS_API, params=params, timeout=10)
         if r.status_code == 200:
             return r.json()
     except Exception as e:
-        st.error(f"API Error: {e}")
+        st.error(f"Connection Error: {e}")
     return []
 
 def tag_file(file_path, author, title, series, desc, cover_url, year, track_num, total_tracks):
@@ -143,7 +135,7 @@ def tag_file(file_path, author, title, series, desc, cover_url, year, track_num,
             if year: audio.tags['\xa9day'] = year
             if cover_url:
                 try:
-                    img_data = requests.get(cover_url).content
+                    img_data = requests.get(cover_url, timeout=5).content
                     audio.tags['covr'] = [MP4Cover(img_data, imageformat=MP4Cover.FORMAT_JPEG)]
                 except: pass
             audio.save()
@@ -158,7 +150,7 @@ def tag_file(file_path, author, title, series, desc, cover_url, year, track_num,
             if desc: audio.add(COMM(encoding=3, lang='eng', desc='Description', text=desc))
             if cover_url:
                 try:
-                    img_data = requests.get(cover_url).content
+                    img_data = requests.get(cover_url, timeout=5).content
                     audio.add(APIC(3, 'image/jpeg', 3, 'Front Cover', img_data))
                 except: pass
             audio.save(file_path)
@@ -185,14 +177,12 @@ def process_selection(source_data, author, title, series, series_part, desc, cov
     os.makedirs(dest_base_folder, exist_ok=True)
 
     files_to_process = []
-    if source_data['type'] == "dir":
-        for root, _, files in os.walk(working_source_path):
-            for file in files:
-                if file.lower().endswith(('.mp3', '.m4b', '.m4a', '.flac')):
-                    files_to_process.append(os.path.join(root, file))
-        files_to_process.sort() 
-    else:
-        files_to_process.append(working_source_path)
+    # Always dir mode now since we are recursively scanning folders
+    for root, _, files in os.walk(working_source_path):
+        for file in files:
+            if file.lower().endswith(('.mp3', '.m4b', '.m4a', '.flac')):
+                files_to_process.append(os.path.join(root, file))
+    files_to_process.sort() 
 
     total_files = len(files_to_process)
     pad_length = len(str(total_files))
@@ -222,7 +212,7 @@ def process_selection(source_data, author, title, series, series_part, desc, cov
         tag_file(dest_file_path, author, title, series, desc, cover_url, publish_year, i+1, total_files)
         progress_bar.progress((i + 1) / total_files)
 
-    if mode == "FIX" and source_data['type'] == "dir":
+    if mode == "FIX":
         try: shutil.rmtree(working_source_path)
         except: pass
 
@@ -242,16 +232,12 @@ def process_selection(source_data, author, title, series, series_part, desc, cov
     with open(os.path.join(dest_base_folder, "metadata.json"), 'w', encoding='utf-8') as f:
         json.dump(abs_metadata, f, indent=4)
 
-    # Add to history
     history = load_json(HISTORY_FILE, [])
     if source_data['path'] not in history:
         history.append(source_data['path'])
         save_json(HISTORY_FILE, history)
         
-    # Invalidate Cache if we added a new book to library (Status 0)
     if mode == "COPY":
-        # We assume the library changed, so we force a refresh next time or update cache manually
-        # Simplest is to just delete cache file to force rebuild on next load
         if os.path.exists(CACHE_FILE):
             os.remove(CACHE_FILE)
 
@@ -268,21 +254,27 @@ col1, col2 = st.columns([1, 2])
 with col1:
     st.subheader("📂 Untidy Queue")
     
-    # Force Refresh Button
     if st.button("🔄 Force Refresh Library"):
         st.cache_data.clear()
         if os.path.exists(CACHE_FILE): os.remove(CACHE_FILE)
         st.rerun()
 
-    # Load candidates (uses cache unless forced)
     items = get_candidates()
     
     if not items:
-        st.info("No items found.")
+        st.info("No audio folders found.")
         selected_item = None
     else:
-        selected_label = st.radio("Select Book:", [x['label'] for x in items], index=0)
-        selected_item = next((x for x in items if x['label'] == selected_label), None)
+        # We need a unique key for the radio button options to avoid duplicates if folders have same name
+        # But for display we want the label
+        # Trick: Create a mapping
+        label_map = {f"{x['label']} (ID:{i})": x for i, x in enumerate(items)}
+        
+        # Display simplified labels
+        display_labels = list(label_map.keys())
+        
+        selected_key = st.radio("Select Book:", display_labels, index=0, format_func=lambda x: label_map[x]['label'])
+        selected_item = label_map[selected_key]
 
 with col2:
     if selected_item:
@@ -294,7 +286,7 @@ with col2:
             st.success("✅ **Processed:** Already in history.")
 
         st.subheader("✏️ Book Details")
-        st.caption(f"Target: `{folder_name}`")
+        st.caption(f"Folder: `{folder_name}`")
         
         with st.expander("🔍 Search Database", expanded=True):
             c_search, c_btn = st.columns([3,1])
