@@ -17,7 +17,7 @@ HISTORY_FILE = os.path.join(DATA_DIR, "processed_log.json")
 CACHE_FILE = os.path.join(DATA_DIR, "library_map_cache.json")
 
 # API ENDPOINTS
-AUDNEXUS_API = "https://api.audnexus.com/books"
+AUDNEXUS_API = "https://api.audnex.us/books"  # <--- UPDATED URL
 ITUNES_API = "https://itunes.apple.com/search"
 GOOGLE_BOOKS_API = "https://www.googleapis.com/books/v1/volumes"
 
@@ -34,6 +34,7 @@ if 'exp_root' not in st.session_state: st.session_state['exp_root'] = DOWNLOAD_D
 if 'sync_selection' not in st.session_state: st.session_state['sync_selection'] = None
 if 'current_selection_data' not in st.session_state: st.session_state['current_selection_data'] = None
 if 'search_provider' not in st.session_state: st.session_state['search_provider'] = "Audible"
+if 'last_jumped_path' not in st.session_state: st.session_state['last_jumped_path'] = None
 
 # --- Persistence ---
 def load_json(filepath, default=None):
@@ -364,12 +365,10 @@ with st.sidebar.expander("📂 File System Explorer", expanded=False):
             st.session_state['exp_path'] = os.path.dirname(current_path)
             st.rerun()
             
-    # --- MANUAL IMPORT BUTTON ---
-    # Only show if we are deep inside the Library (not at root)
+    # MANUAL IMPORT BUTTON
     if selected_root_label == "Audiobooks" and current_path != LIBRARY_DIR:
         st.markdown("#### 🛠️ Manual Actions")
         if st.button("✅ Force Mark as 'Imported'"):
-            # Create minimal metadata.json to satisfy the "Green Check" logic
             folder_name = os.path.basename(current_path)
             meta_path = os.path.join(current_path, "metadata.json")
             
@@ -379,12 +378,10 @@ with st.sidebar.expander("📂 File System Explorer", expanded=False):
                 "description": "Manually marked as imported."
             }
             
-            # Write file
             with open(meta_path, 'w') as f:
                 json.dump(minimal_meta, f, indent=4)
                 
             st.success(f"Marked '{folder_name}' as imported!")
-            # Trigger Library Rescan to update main list
             scan_library_now()
             st.cache_data.clear()
             time.sleep(1)
@@ -416,6 +413,7 @@ all_items = get_candidates_with_status()
 new_items = [x for x in all_items if x['status_code'] == 0]
 existing_items = [x for x in all_items if x['status_code'] > 0]
 
+# Sync Logic 1: Explorer -> List
 if st.session_state['sync_selection']:
     sync_target = st.session_state['sync_selection']
     matching = [x for x in all_items if x['path'] == sync_target or sync_target.startswith(x['path'])]
@@ -463,8 +461,20 @@ with col1:
             if sel_exist.selection.rows:
                 st.session_state['current_selection_data'] = existing_items[sel_exist.selection.rows[0]]
 
-# --- EDITOR PANE ---
+# Sync Logic 2: List -> Explorer
+# If a book is selected, we update the explorer to show that location
 selected_item = st.session_state.get('current_selection_data')
+if selected_item:
+    # Check if we need to jump the explorer (prevents infinite loop)
+    if selected_item['path'] != st.session_state.get('last_jumped_path'):
+        st.session_state['exp_path'] = selected_item['path']
+        st.session_state['last_jumped_path'] = selected_item['path']
+        # Switch root if needed
+        if selected_item['path'].startswith(LIBRARY_DIR):
+            st.session_state['exp_root'] = LIBRARY_DIR
+        else:
+            st.session_state['exp_root'] = DOWNLOAD_DIR
+        st.rerun()
 
 with col2:
     if selected_item:
