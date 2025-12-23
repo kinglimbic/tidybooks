@@ -1,0 +1,15 @@
+version: '3.8'
+services:
+  tidybooks:  # Service Name Changed
+    build: .
+    container_name: tidybooks  # Container Name Changed
+    ports:
+      - "8502:8501"
+    volumes:
+      # Remember to verify your Synology paths on the left
+      - /volume2/Zack/media/downloads/Audiobooks - MAM - Seeding:/downloads:ro
+      - /volume2/media/audiobooks:/audiobooks:rw
+    environment:
+      - PUID=0
+      - PGID=0
+    restart: unless-stopped
