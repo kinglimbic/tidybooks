@@ -18,7 +18,7 @@ HISTORY_FILE = os.path.join(DATA_DIR, "processed_log.json")
 CACHE_FILE = os.path.join(DATA_DIR, "library_map_cache.json")
 
 # API ENDPOINTS
-AUDNEXUS_API = "https://api.audnex.us/books" # Corrected URL
+AUDNEXUS_API = "https://api.audnex.us/books"
 ITUNES_API = "https://itunes.apple.com/search"
 GOOGLE_BOOKS_API = "https://www.googleapis.com/books/v1/volumes"
 
@@ -34,7 +34,7 @@ for key in default_keys:
 if 'exp_path' not in st.session_state: st.session_state['exp_path'] = DOWNLOAD_DIR
 if 'sync_selection' not in st.session_state: st.session_state['sync_selection'] = None
 if 'current_selection_data' not in st.session_state: st.session_state['current_selection_data'] = None
-if 'search_provider' not in st.session_state: st.session_state['search_provider'] = "Audible"
+if 'search_provider' not in st.session_state: st.session_state['search_provider'] = "Audible" # Default back to Audible
 if 'last_jumped_path' not in st.session_state: st.session_state['last_jumped_path'] = None
 if 'manual_books' not in st.session_state: st.session_state['manual_books'] = []
 if 'last_synced_book_id' not in st.session_state: st.session_state['last_synced_book_id'] = None
@@ -211,6 +211,7 @@ def get_candidates_with_status():
     cached_lib = load_json(CACHE_FILE, [])
     if not cached_lib: cached_lib = scan_library_now()
     
+    # Process lists
     auto_processed = calculate_matches(raw_candidates, cached_lib, history)
     manual_processed = calculate_matches(manual_items, cached_lib, history)
     
@@ -240,32 +241,52 @@ def extract_details_smart(title, desc, subtitle=""):
         part = match_series_b.group(2).strip()
     return narrator, series, part
 
-def fetch_audnexus(query):
-    # Added Browser Headers to fix connectivity
+def fetch_audnexus_twostep(query):
+    """
+    Two-Step Search:
+    1. Search Audible.com website to find the ASIN (e.g. B0xxxx)
+    2. Use ASIN to query Audnexus API
+    """
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
     }
+    
+    # Step 1: Scrape ASIN
+    asin = None
     try:
-        r = requests.get(AUDNEXUS_API, params={'q': query}, headers=headers, timeout=10)
-        r.raise_for_status()
-        data = r.json()
-        results = []
-        for b in data:
-            results.append({
-                "title": b.get('title'),
-                "authors": ", ".join(b.get('authors', [])),
-                "narrators": ", ".join(b.get('narrators', [])),
-                "series": b.get('seriesPrimary', ''),
-                "part": b.get('seriesPrimarySequence', ''),
-                "summary": b.get('summary', ''),
-                "image": b.get('image', ''),
-                "releaseDate": b.get('releaseDate', ''),
-                "source": "Audible"
-            })
-        return results
-    except Exception as e:
-        st.error(f"Audible Error: {e}")
-        return []
+        search_url = "https://www.audible.com/search"
+        r_search = requests.get(search_url, params={'keywords': query}, headers=headers, timeout=8)
+        
+        # Regex to find the first ASIN in the search results
+        # Looks for: data-asin="B0xxxxxxxx"
+        match = re.search(r'data-asin="(B0[A-Z0-9]{8})"', r_search.text)
+        if match:
+            asin = match.group(1)
+    except:
+        pass # Fail silently to step 2
+
+    # Step 2: Fetch Metadata
+    if asin:
+        try:
+            api_url = f"{AUDNEXUS_API}/{asin}"
+            r_api = requests.get(api_url, headers=headers, timeout=8)
+            if r_api.status_code == 200:
+                b = r_api.json()
+                # Return list (standard format)
+                return [{
+                    "title": b.get('title'),
+                    "authors": ", ".join(b.get('authors', [])),
+                    "narrators": ", ".join(b.get('narrators', [])),
+                    "series": b.get('seriesPrimary', ''),
+                    "part": b.get('seriesPrimarySequence', ''),
+                    "summary": b.get('summary', ''),
+                    "image": b.get('image', ''),
+                    "releaseDate": b.get('releaseDate', ''),
+                    "source": "Audible"
+                }]
+        except: pass
+    
+    return []
 
 def fetch_itunes(query):
     try:
@@ -306,7 +327,7 @@ def fetch_google(query):
     return []
 
 def fetch_metadata_router(query, provider):
-    if provider == "Audible": return fetch_audnexus(query)
+    if provider == "Audible": return fetch_audnexus_twostep(query)
     elif provider == "Apple Books": return fetch_itunes(query)
     return fetch_google(query)
 
@@ -415,7 +436,7 @@ if st.session_state['sync_selection']:
     matching = [x for x in all_known if x['path'] == sync_target or sync_target.startswith(x['path'])]
     if matching:
         st.session_state['current_selection_data'] = matching[0]
-        # Auto-Switch Logic: If manual, bump manual key. If auto, bump auto key.
+        # Auto-switch to correct grid
         if matching[0] in manual_processed:
             st.session_state['grid_key_auto'] += 1
             st.session_state['grid_key_match'] += 1
@@ -432,7 +453,7 @@ if st.session_state['sync_selection']:
 with col1:
     tab_new, tab_built, tab_match, tab_exist = st.tabs(["🆕 Untidy", "🛠️ Built", "⚠️ Match", "📚 Done"])
     
-    # Grid Deselection Logic
+    # Auto-Deselect Helper: Forces re-render of other grids when one is clicked
     def on_grid_select(grid_name):
         if grid_name == 'untidy': 
             st.session_state['grid_key_manual'] += 1
@@ -464,7 +485,7 @@ with col1:
             if sel.selection.rows: st.session_state['current_selection_data'] = new_items[sel.selection.rows[0]]
 
     with tab_built:
-        if not built_items: st.info("Use Explorer to bundle files.")
+        if not built_items: st.info("Use Explorer to bundle.")
         else:
             df = pd.DataFrame(built_items)
             sel = st.dataframe(
@@ -587,7 +608,7 @@ with col2:
 
 # --- COL 3: EXPLORER ---
 with col3:
-    st.subheader("📂 Explorer & Builder")
+    st.subheader("📂 Explorer")
     curr_path = st.session_state['exp_path']
     col_u, col_p = st.columns([0.2, 0.8])
     with col_u:
