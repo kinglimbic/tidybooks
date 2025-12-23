@@ -1,5 +1,5 @@
 import streamlit as st
-import pandas as pd  # <--- NEW IMPORT
+import pandas as pd
 import os
 import shutil
 import requests
@@ -28,6 +28,8 @@ for key in default_keys:
 if 'exp_path' not in st.session_state: st.session_state['exp_path'] = DOWNLOAD_DIR
 if 'exp_root' not in st.session_state: st.session_state['exp_root'] = DOWNLOAD_DIR
 if 'sync_selection' not in st.session_state: st.session_state['sync_selection'] = None
+# Stores the currently selected item data regardless of which tab it came from
+if 'current_selection_data' not in st.session_state: st.session_state['current_selection_data'] = None
 
 # --- Persistence ---
 def load_json(filepath, default=None):
@@ -143,29 +145,21 @@ def get_candidates_with_status():
                         status = 1
                     break
         
-        # We add clean text/emoji for the DataFrame
-        status_icon = "⚪ New"
-        if status == 3: status_icon = "✅ Done"
-        elif status == 2: status_icon = "✅ Library"
-        elif status == 1: status_icon = "🟡 Messy"
+        # New Status Icons for separate tabs
+        status_icon = "⚪"
+        if status == 3: status_icon = "✅"
+        elif status == 2: status_icon = "✅"
+        elif status == 1: status_icon = "🟡"
         
         final_list.append({
             "path": full_path,
             "name": folder_name,
             "status_code": status,
-            "Status": status_icon, # For display
+            "State": status_icon, 
             "match_path": match_path,
         })
 
-    # Sort: White(0) -> Yellow(1) -> Green(2,3)
-    def sort_key(x):
-        s = x['status_code']
-        if s == 0: rank = 0
-        elif s == 1: rank = 1
-        else: rank = 2
-        return (rank, x['name'])
-
-    return sorted(final_list, key=sort_key)
+    return final_list
 
 def fetch_metadata(query):
     try:
@@ -284,6 +278,7 @@ def process_selection(source_data, author, title, series, series_part, desc, cov
     
     st.success(f"✅ Done: {clean_title}")
     st.cache_data.clear()
+    st.session_state['current_selection_data'] = None
     time.sleep(1)
     st.rerun()
 
@@ -342,59 +337,82 @@ with st.sidebar.expander("📂 File System Explorer", expanded=False):
 col1, col2 = st.columns([1, 2])
 
 # Load Items
-items = get_candidates_with_status()
+all_items = get_candidates_with_status()
 
-# Logic to Handle "Sync from Explorer"
-# If the user clicked a folder in Explorer, we try to find it in the list and filter to it
-filtered_items = items
+# Separation Logic
+# Status 0 = New/Untidy
+# Status 1,2,3 = Imported/Existing
+new_items = [x for x in all_items if x['status_code'] == 0]
+existing_items = [x for x in all_items if x['status_code'] > 0]
+
+# --- SYNC LOGIC (Pre-Filter) ---
+# If Explorer was clicked, we try to find that path in EITHER list
 if st.session_state['sync_selection']:
     sync_target = st.session_state['sync_selection']
-    # Filter items to only the one that matches
-    matching = [x for x in items if x['path'] == sync_target or sync_target.startswith(x['path'])]
+    # Check if this item exists in all_items
+    matching = [x for x in all_items if x['path'] == sync_target or sync_target.startswith(x['path'])]
     if matching:
-        filtered_items = matching
-        st.info(f"📍 Jumped to: {matching[0]['name']}")
-
-# Convert to Pandas for Interactive Table
-df = pd.DataFrame(filtered_items)
+        target_item = matching[0]
+        st.session_state['current_selection_data'] = target_item
+        st.toast(f"Jumped to: {target_item['name']}")
+        st.session_state['sync_selection'] = None # Clear trigger
 
 with col1:
-    st.subheader("📂 Untidy Queue")
+    tab_new, tab_exist = st.tabs(["🆕 Untidy Queue", "📚 Already Imported"])
     
-    if df.empty:
-        st.info("Queue Empty.")
-        selected_item = None
-    else:
-        # Configure the Dataframe
-        selection = st.dataframe(
-            df[['Status', 'name']],
-            column_config={
-                "Status": st.column_config.TextColumn("Status", width="small"),
-                "name": st.column_config.TextColumn("Folder Name"),
-            },
-            use_container_width=True,
-            hide_index=True,
-            on_select="rerun",
-            selection_mode="single-row"
-        )
-        
-        # Get selected row
-        if selection.selection.rows:
-            selected_idx = selection.selection.rows[0]
-            selected_item = filtered_items[selected_idx]
+    # --- TAB 1: NEW ITEMS ---
+    with tab_new:
+        if not new_items:
+            st.info("Nothing new to import!")
         else:
-            selected_item = None
+            df_new = pd.DataFrame(new_items)
+            sel_new = st.dataframe(
+                df_new[['name']],
+                column_config={"name": st.column_config.TextColumn("Folder Name")},
+                use_container_width=True,
+                hide_index=True,
+                height=500, # Fixed height so it doesn't collapse
+                on_select="rerun",
+                selection_mode="single-row",
+                key="grid_new"
+            )
+            if sel_new.selection.rows:
+                st.session_state['current_selection_data'] = new_items[sel_new.selection.rows[0]]
+
+    # --- TAB 2: EXISTING ITEMS ---
+    with tab_exist:
+        if not existing_items:
+            st.info("No imported items found yet.")
+        else:
+            df_exist = pd.DataFrame(existing_items)
+            sel_exist = st.dataframe(
+                df_exist[['State', 'name']],
+                column_config={
+                    "State": st.column_config.TextColumn("State", width="small"),
+                    "name": st.column_config.TextColumn("Folder Name")
+                },
+                use_container_width=True,
+                hide_index=True,
+                height=500,
+                on_select="rerun",
+                selection_mode="single-row",
+                key="grid_exist"
+            )
+            if sel_exist.selection.rows:
+                st.session_state['current_selection_data'] = existing_items[sel_exist.selection.rows[0]]
+
+# --- EDITOR PANE ---
+selected_item = st.session_state.get('current_selection_data')
 
 with col2:
     if selected_item:
         st.subheader("✏️ Editor")
         st.caption(f"Path: `{selected_item['name']}`")
         
-        # Clear Sync button (if we are in sync mode)
-        if st.session_state['sync_selection']:
-            if st.button("❌ Clear Filter"):
-                st.session_state['sync_selection'] = None
-                st.rerun()
+        # Helper to clear selection
+        if st.button("❌ Close Selection"):
+            st.session_state['current_selection_data'] = None
+            st.rerun()
 
         clean_q = clean_search_query(selected_item['name'])
         q = st.text_input("Search", value=clean_q)
@@ -449,3 +467,5 @@ with col2:
                 if auth and titl:
                     process_selection(selected_item, auth, titl, seri, part, desc, img, narr, year)
                 else: st.error("Author/Title Required")
+    else:
+        st.info("Select a book from the left to edit.")
