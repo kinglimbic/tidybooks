@@ -32,36 +32,48 @@ def save_json(filepath, data):
     with open(filepath, 'w') as f: json.dump(data, f)
 
 def get_library_map(force_refresh=False):
+    """
+    Returns a dictionary: { "CleanFolderName": "/full/path/to/folder/in/library" }
+    """
     if not force_refresh:
         cached = load_json(CACHE_FILE)
         if cached is not None: return cached
             
     try:
         library_map = {}
+        # Recursive scan of the library
         for root, dirs, files in os.walk(LIBRARY_DIR):
             folder_name = os.path.basename(root)
-            library_map[folder_name] = root
+            # Store both the raw name AND a cleaned version for fuzzy matching
+            # We map the Clean Name to the Full Path
+            clean_key = sanitize_for_matching(folder_name)
+            if clean_key:
+                library_map[clean_key] = root
+        
         save_json(CACHE_FILE, library_map)
         return library_map
     except:
         return {}
 
 # --- Helper Functions ---
+def sanitize_for_matching(text):
+    """
+    Super aggressive cleaner for matching logic.
+    Removes spaces, punctuation, common junk words.
+    'Harry Potter - Book 1 (2000)' -> 'harrypotterbook1'
+    """
+    text = text.lower()
+    text = re.sub(r'\b(audiobook|mp3|m4b|cd|disc|part|v|vol)\b', '', text)
+    text = re.sub(r'[^a-z0-9]', '', text)
+    return text
+
 def sanitize_filename(name, default_to_unknown=False):
-    """
-    Cleans filename. 
-    If default_to_unknown is True (for Author/Title), returns 'Unknown' if empty.
-    If False (for Series), returns empty string if empty.
-    """
     if not name:
         return "Unknown" if default_to_unknown else ""
-        
     clean = name.replace("/", "-").replace("\\", "-")
     clean = re.sub(r'[<>:"|?*]', '', clean).strip()
-    
     if not clean and default_to_unknown:
         return "Unknown"
-        
     return clean
 
 def is_part_folder(folder_name):
@@ -72,7 +84,7 @@ def is_part_folder(folder_name):
     return False
 
 def is_junk_folder(folder_name):
-    junk = ['sample', 'samples', 'extra', 'extras', 'proof', 'interview', 'interviews', '.zab']
+    junk = ['sample', 'samples', 'extra', 'extras', 'proof', 'interview', 'interviews', '.zab', 'artwork']
     return folder_name.lower() in junk
 
 def clean_search_query(text):
@@ -126,6 +138,7 @@ def get_candidates(force_refresh=False):
                 }
 
     final_list = []
+    
     for path, data in candidate_map.items():
         folder_name = data['name']
         full_path = data['path']
@@ -134,18 +147,36 @@ def get_candidates(force_refresh=False):
         display_prefix = ""
         match_path = None
         
+        # --- MATCHING LOGIC ---
+        
+        # 1. Exact History Match
         if full_path in history:
             status = 3
             display_prefix = "✅ (History) "
-        elif folder_name in library_map:
-            lib_path = library_map[folder_name]
-            match_path = lib_path
-            if os.path.exists(os.path.join(lib_path, "metadata.json")):
-                status = 2 
-                display_prefix = "✅ "
-            else:
-                status = 1 
-                display_prefix = "🟨 "
+            
+        else:
+            # 2. Fuzzy Library Match
+            # We clean the download folder name and check if it exists in our library map keys
+            clean_download_name = sanitize_for_matching(folder_name)
+            
+            # Direct Key Match
+            if clean_download_name in library_map:
+                match_path = library_map[clean_download_name]
+            
+            # Partial Match (Slower, but catches "Title (2022)" vs "Title")
+            if not match_path:
+                for lib_key, lib_path in library_map.items():
+                    if len(lib_key) > 5 and (lib_key in clean_download_name or clean_download_name in lib_key):
+                        match_path = lib_path
+                        break
+            
+            if match_path:
+                if os.path.exists(os.path.join(match_path, "metadata.json")):
+                    status = 2 
+                    display_prefix = "✅ "
+                else:
+                    status = 1 
+                    display_prefix = "🟨 "
         
         final_list.append({
             "label": f"{display_prefix}{folder_name}",
@@ -213,12 +244,10 @@ def process_selection(source_data, author, title, series, series_part, desc, cov
         mode = "FIX"
         working_source_path = source_data['match_path']
 
-    # --- UPDATED SANITIZATION CALLS ---
     clean_author = sanitize_filename(author, default_to_unknown=True)
     clean_title = sanitize_filename(title, default_to_unknown=True)
-    clean_series = sanitize_filename(series, default_to_unknown=False) # Allows empty string
+    clean_series = sanitize_filename(series, default_to_unknown=False)
     
-    # Logic: Only create series folder if clean_series is not empty
     if clean_series:
         dest_base_folder = os.path.join(LIBRARY_DIR, clean_author, clean_series, clean_title)
     else:
@@ -324,7 +353,7 @@ with col2:
         if selected_item['status'] == 2:
             st.success(f"✅ **Properly Imported:** Found in Library.")
         elif selected_item['status'] == 1:
-            st.warning(f"🟨 **Messy Copy Found:** '{folder_name}' exists in Library but looks untidy.")
+            st.warning(f"🟨 **Messy Copy Found:** A folder named '{folder_name}' (or similar) exists in Library.")
         elif selected_item['status'] == 3:
              st.success("✅ **In History:** Previously processed.")
 
