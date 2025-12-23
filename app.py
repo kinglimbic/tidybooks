@@ -20,12 +20,14 @@ os.makedirs(DATA_DIR, exist_ok=True)
 
 st.set_page_config(page_title="TidyBooks", layout="wide", page_icon="📚")
 
-# --- Initialize Session State for Form ---
-# This ensures the form fields have default values on startup
+# --- Initialize Session State ---
 default_keys = ['form_auth', 'form_title', 'form_narr', 'form_series', 'form_part', 'form_year', 'form_desc', 'form_img']
 for key in default_keys:
-    if key not in st.session_state:
-        st.session_state[key] = ""
+    if key not in st.session_state: st.session_state[key] = ""
+
+# File Explorer State
+if 'exp_path' not in st.session_state: st.session_state['exp_path'] = DOWNLOAD_DIR
+if 'exp_root' not in st.session_state: st.session_state['exp_root'] = DOWNLOAD_DIR
 
 # --- Persistence ---
 def load_json(filepath, default=None):
@@ -63,9 +65,8 @@ def clean_search_query(text):
     text = text.replace('.', ' ').replace('_', ' ').replace('-', ' ')
     return re.sub(r'\s+', ' ', text).strip()
 
-# --- Library Scanning (Lazy Load) ---
+# --- Library Scanning ---
 def scan_library_now():
-    """Manual trigger to scan library and save to cache."""
     library_items = []
     for root, dirs, files in os.walk(LIBRARY_DIR):
         has_audio = any(f.lower().endswith(('.mp3', '.m4b', '.m4a', '.flac')) for f in files)
@@ -80,15 +81,9 @@ def scan_library_now():
     return library_items
 
 def get_candidates():
-    # Load history
     history = load_json(HISTORY_FILE, [])
-    
-    # Load library cache
     cached_lib = load_json(CACHE_FILE, None)
-    if not cached_lib or not isinstance(cached_lib, list):
-        library_items = [] 
-    else:
-        library_items = cached_lib
+    library_items = cached_lib if (cached_lib and isinstance(cached_lib, list)) else []
     
     if not os.path.exists(DOWNLOAD_DIR): return []
 
@@ -96,12 +91,11 @@ def get_candidates():
 
     for root, dirs, files in os.walk(DOWNLOAD_DIR):
         audio_files = [f for f in files if f.lower().endswith(('.mp3', '.m4b', '.m4a', '.flac'))]
-        
         if audio_files:
             folder_name = os.path.basename(root)
             if is_junk_folder(folder_name): continue
-
-            # Skip subfolders unless they are hidden
+            
+            # Skip unless all subfolders are hidden
             has_real_subfolders = any(not d.startswith('.') for d in dirs)
             if has_real_subfolders: continue
 
@@ -109,7 +103,6 @@ def get_candidates():
             target_name = folder_name
             parent_path = os.path.dirname(root)
             
-            # Bubble up CD/Part folders
             if re.match(r'^(cd|disc|part|vol|chapter)?\s*\d+$', folder_name, re.IGNORECASE):
                  if os.path.abspath(parent_path) != os.path.abspath(DOWNLOAD_DIR):
                      target_path = parent_path
@@ -123,7 +116,6 @@ def get_candidates():
                 }
 
     final_list = []
-    
     for path, data in candidate_map.items():
         folder_name = data['name']
         clean_dl = data['clean']
@@ -138,7 +130,6 @@ def get_candidates():
             for lib_item in library_items:
                 clean_lib = lib_item.get('clean')
                 if not clean_lib: continue
-                
                 if len(clean_lib) > 4 and (clean_lib in clean_dl or clean_dl in clean_lib):
                     match_path = lib_item['path']
                     if os.path.exists(os.path.join(match_path, "metadata.json")):
@@ -161,18 +152,7 @@ def get_candidates():
             "name": folder_name
         })
 
-    # --- UPDATED SORTING LOGIC ---
-    # Rank 0: Status 0 (New/White) - Appears first
-    # Rank 1: Status 1 (Yellow) - Appears second
-    # Rank 2: Status 2/3 (Green/Done) - Appears last
-    def sort_key(x):
-        s = x['status']
-        rank = 2
-        if s == 0: rank = 0
-        elif s == 1: rank = 1
-        return (rank, x['name'])
-
-    return sorted(final_list, key=sort_key)
+    return sorted(final_list, key=lambda x: (1 if x['status'] >= 2 else 0, x['status'] == 2, x['name']))
 
 def fetch_metadata(query):
     try:
@@ -233,7 +213,6 @@ def process_selection(source_data, author, title, series, series_part, desc, cov
     pad = max(2, len(str(total)))
     
     bar = st.progress(0)
-    
     for i, src in enumerate(files):
         ext = os.path.splitext(src)[1]
         name = f"{str(i+1).zfill(pad)} - {clean_title}{ext}" if total > 1 else f"{clean_title}{ext}"
@@ -241,7 +220,6 @@ def process_selection(source_data, author, title, series, series_part, desc, cov
         
         if mode == "FIX" and os.path.abspath(src) != os.path.abspath(dst): shutil.move(src, dst)
         else: shutil.copy2(src, dst)
-        
         tag_file(dst, author, title, series, desc, cover_url, publish_year, i+1, total)
         bar.progress((i+1)/total)
 
@@ -260,31 +238,74 @@ def process_selection(source_data, author, title, series, series_part, desc, cov
 
     with open(os.path.join(dest_base, "metadata.json"), 'w') as f: json.dump(abs_meta, f, indent=4)
 
-    # History & Cache Update
     hist = load_json(HISTORY_FILE, [])
     if source_data['path'] not in hist:
         hist.append(source_data['path'])
         save_json(HISTORY_FILE, hist)
     
     st.success(f"✅ Done: {clean_title}")
-    
-    # Clear form state for next book
-    for key in default_keys:
-        st.session_state[key] = ""
-        
+    for key in default_keys: st.session_state[key] = ""
     time.sleep(1)
     st.rerun()
 
 # --- MAIN UI ---
 st.sidebar.title("🛠️ Tools")
 
-# Manual Scan Trigger
+# --- 1. Library Scanner ---
 if st.sidebar.button("📉 Update Library Map"):
     with st.spinner("Scanning library..."):
         scan_library_now()
     st.success("Library updated!")
     st.rerun()
 
+# --- 2. File Explorer (NEW) ---
+st.sidebar.markdown("---")
+with st.sidebar.expander("📂 File System Explorer", expanded=False):
+    # Selector for Root
+    root_options = {"Downloads": DOWNLOAD_DIR, "Audiobooks": LIBRARY_DIR}
+    selected_root_label = st.selectbox("Volume:", list(root_options.keys()))
+    new_root = root_options[selected_root_label]
+    
+    # Handle root switching
+    if st.session_state['exp_root'] != new_root:
+        st.session_state['exp_root'] = new_root
+        st.session_state['exp_path'] = new_root
+
+    current_path = st.session_state['exp_path']
+    st.caption(f"📍 `{current_path}`")
+
+    # Navigation: UP
+    if current_path != new_root:
+        if st.button("⬆️ Up Level"):
+            st.session_state['exp_path'] = os.path.dirname(current_path)
+            st.rerun()
+    
+    # Listing Content
+    try:
+        items = sorted(os.listdir(current_path))
+        dirs = [i for i in items if os.path.isdir(os.path.join(current_path, i))]
+        files = [i for i in items if not os.path.isdir(os.path.join(current_path, i))]
+
+        if dirs:
+            st.markdown("**Folders:**")
+            for d in dirs:
+                # Using columns for tighter layout
+                if st.button(f"📁 {d}", key=f"dir_{d}"):
+                    st.session_state['exp_path'] = os.path.join(current_path, d)
+                    st.rerun()
+        
+        if files:
+            st.markdown("**Files:**")
+            for f in files:
+                st.text(f"📄 {f}")
+                
+        if not dirs and not files:
+            st.caption("(Empty Folder)")
+            
+    except Exception as e:
+        st.error(f"Access Denied: {e}")
+
+# --- MAIN PAGE ---
 col1, col2 = st.columns([1, 2])
 
 with col1:
@@ -306,15 +327,12 @@ with col2:
         clean_q = clean_search_query(selected_item['name'])
         q = st.text_input("Search", value=clean_q)
         
-        # --- CALLBACK LOGIC START ---
         def update_form_state():
-            """Force update session state keys from the search result"""
             if 'result_selector' in st.session_state and 'search_results' in st.session_state:
-                # Find the object in the results list corresponding to the selected text
-                options = {f"{b.get('authors')} - {b.get('title')}": b for b in st.session_state['search_results']}
+                opts = {f"{b.get('authors')} - {b.get('title')}": b for b in st.session_state['search_results']}
                 sel_key = st.session_state['result_selector']
-                if sel_key in options:
-                    data = options[sel_key]
+                if sel_key in opts:
+                    data = opts[sel_key]
                     st.session_state['form_auth'] = data.get('authors', '')
                     st.session_state['form_title'] = data.get('title', '')
                     st.session_state['form_narr'] = data.get('narrators', '')
@@ -330,24 +348,17 @@ with col2:
                 res = fetch_metadata(q)
                 if res:
                     st.session_state['search_results'] = res
-                    # Pre-select first item
-                    first_opt = f"{res[0].get('authors')} - {res[0].get('title')}"
-                    st.session_state['result_selector'] = first_opt
-                    # Manually trigger the update for the first item
+                    first = f"{res[0].get('authors')} - {res[0].get('title')}"
+                    st.session_state['result_selector'] = first
                     update_form_state()
-                else:
-                    st.warning("No matches found.")
+                else: st.warning("No matches found.")
 
-        # If results exist, show dropdown
         if 'search_results' in st.session_state:
             opts = [f"{b.get('authors')} - {b.get('title')}" for b in st.session_state['search_results']]
-            if opts:
-                st.selectbox("Results", opts, key='result_selector', on_change=update_form_state)
-        # --- CALLBACK LOGIC END ---
+            if opts: st.selectbox("Results", opts, key='result_selector', on_change=update_form_state)
 
         with st.form("main"):
             c1, c2 = st.columns(2)
-            # Use keys to bind inputs to session state
             auth = c1.text_input("Author", key='form_auth')
             titl = c1.text_input("Title", key='form_title')
             narr = c1.text_input("Narrator", key='form_narr')
