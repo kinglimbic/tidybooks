@@ -7,8 +7,6 @@ import re
 import time
 from mutagen.mp4 import MP4, MP4Cover
 from mutagen.id3 import ID3, TIT2, TPE1, TALB, APIC, COMM, TRCK
-from watchdog.observers import Observer
-from watchdog.events import FileSystemEventHandler
 
 # --- Configuration ---
 DOWNLOAD_DIR = "/downloads"
@@ -65,13 +63,23 @@ def is_junk_folder(folder_name):
     junk = ['sample', 'samples', 'extra', 'extras', 'proof', 'interview', 'interviews', '.zab']
     return folder_name.lower() in junk
 
+def clean_search_query(text):
+    """
+    Aggressively cleans torrent folder names for better search results.
+    Removes: (2021), [128k], {Audiobook}, - AuthorName
+    """
+    # 1. Remove content inside brackets (), [], {}
+    text = re.sub(r'[\(\[\{].*?[\)\]\}]', '', text)
+    # 2. Remove common file info keywords
+    text = re.sub(r'\b(mp3|m4b|128k|64k|192k|aac)\b', '', text, flags=re.IGNORECASE)
+    # 3. Remove CD/Part numbering
+    text = re.sub(r'\b(cd|disc|part|vol|v)\s*\d+\b', '', text, flags=re.IGNORECASE)
+    # 4. Replace separators with spaces
+    text = text.replace('.', ' ').replace('_', ' ').replace('-', ' ')
+    # 5. Collapse multiple spaces
+    return re.sub(r'\s+', ' ', text).strip()
+
 def get_candidates(force_refresh=False):
-    """
-    STRICT SCANNER:
-    1. Ignores any folder that contains SUB-FOLDERS (assumes it's a Collection/Author folder).
-    2. Aggregates "CD 1", "Disc 2" into parent.
-    3. Ignores Junk.
-    """
     history = load_json(HISTORY_FILE, [])
     library_map = get_library_map(force_refresh)
     
@@ -89,47 +97,33 @@ def get_candidates(force_refresh=False):
             parent_name = os.path.basename(parent_path)
             
             # --- STRICT FILTERING ---
-            
-            # 1. Skip if Junk
-            if is_junk_folder(folder_name):
-                continue
+            if is_junk_folder(folder_name): continue
 
-            # 2. Skip if this folder contains sub-directories (It's a Container/Collection)
-            # Exception: Unless the sub-directories are just "metadata" folders like .zab or artwork
+            # Skip if contains subfolders (unless hidden)
             has_real_subfolders = False
             for d in dirs:
-                if not d.startswith('.'): # Ignore hidden folders
+                if not d.startswith('.'): 
                     has_real_subfolders = True
                     break
-            
-            if has_real_subfolders:
-                # This folder has audio files BUT also has subfolders. 
-                # It is likely a messy parent folder (e.g. Author Folder with loose files + Book folders).
-                # We SKIP it to encourage processing the sub-folders instead.
-                continue
+            if has_real_subfolders: continue
 
-            # 3. Handle CD/Part Aggregation
             target_path = root
             target_name = folder_name
             
             if is_part_folder(folder_name):
                 target_path = parent_path
                 target_name = parent_name
-                # Safety: Don't bubble up to root
                 if os.path.abspath(target_path) == os.path.abspath(DOWNLOAD_DIR):
                     target_path = root
                     target_name = folder_name
             
-            # Add to map
             if target_path not in candidate_map:
                 candidate_map[target_path] = {
                     "path": target_path,
                     "name": target_name
                 }
 
-    # Process Status
     final_list = []
-    
     for path, data in candidate_map.items():
         folder_name = data['name']
         full_path = data['path']
@@ -164,14 +158,14 @@ def get_candidates(force_refresh=False):
 
 def fetch_metadata(query):
     try:
-        # Added User-Agent to avoid some API blocks
         headers = {'User-Agent': 'TidyBooks/1.0'}
         params = {'q': query}
-        r = requests.get(AUDNEXUS_API, params=params, headers=headers, timeout=10)
+        # Increased timeout to 15 seconds
+        r = requests.get(AUDNEXUS_API, params=params, headers=headers, timeout=15)
         if r.status_code == 200:
             return r.json()
     except Exception as e:
-        st.error(f"API Error: {e}")
+        st.error(f"Search Error: {e}")
     return []
 
 def tag_file(file_path, author, title, series, desc, cover_url, year, track_num, total_tracks):
@@ -188,7 +182,7 @@ def tag_file(file_path, author, title, series, desc, cover_url, year, track_num,
             if year: audio.tags['\xa9day'] = year
             if cover_url:
                 try:
-                    img_data = requests.get(cover_url, timeout=5).content
+                    img_data = requests.get(cover_url, timeout=10).content
                     audio.tags['covr'] = [MP4Cover(img_data, imageformat=MP4Cover.FORMAT_JPEG)]
                 except: pass
             audio.save()
@@ -203,7 +197,7 @@ def tag_file(file_path, author, title, series, desc, cover_url, year, track_num,
             if desc: audio.add(COMM(encoding=3, lang='eng', desc='Description', text=desc))
             if cover_url:
                 try:
-                    img_data = requests.get(cover_url, timeout=5).content
+                    img_data = requests.get(cover_url, timeout=10).content
                     audio.add(APIC(3, 'image/jpeg', 3, 'Front Cover', img_data))
                 except: pass
             audio.save(file_path)
@@ -337,8 +331,8 @@ with col2:
         with st.expander("🔍 Search Database", expanded=True):
             c_search, c_btn = st.columns([3,1])
             with c_search:
-                clean_guess = folder_name.replace("_", " ").replace("-", " ")
-                clean_guess = re.sub(r'\b(cd|disc|part)\s*\d+\b', '', clean_guess, flags=re.IGNORECASE)
+                # Use our new cleaner function
+                clean_guess = clean_search_query(folder_name)
                 search_query = st.text_input("Search Title", value=clean_guess)
             with c_btn:
                 st.write("##")
