@@ -34,9 +34,6 @@ def save_json(filepath, data):
     with open(filepath, 'w') as f: json.dump(data, f)
 
 def get_library_map(force_refresh=False):
-    """
-    Returns a dictionary: { "FolderName": "/full/path/to/folder/in/library" }
-    """
     if not force_refresh:
         cached = load_json(CACHE_FILE)
         if cached is not None: return cached
@@ -58,25 +55,22 @@ def sanitize_filename(name):
     return re.sub(r'[<>:"|?*]', '', clean).strip()
 
 def is_part_folder(folder_name):
-    """
-    Returns True if the folder name looks like 'CD 1', 'Disc 2', 'Part 1', '3', etc.
-    """
-    # Regex for CD 1, Disc 02, Disk A, Part IV, Vol 1, or just digits like "1", "02"
     pattern = r"^(cd|disc|disk|part|vol|volume|chapter)\s*[\d\w]+$"
     simple_digit = r"^\d+$"
-    
     if re.match(pattern, folder_name, re.IGNORECASE) or re.match(simple_digit, folder_name):
         return True
     return False
 
 def is_junk_folder(folder_name):
-    """Returns True if this is likely a Sample or Extras folder."""
-    junk = ['sample', 'samples', 'extra', 'extras', 'proof', 'interview', 'interviews']
+    junk = ['sample', 'samples', 'extra', 'extras', 'proof', 'interview', 'interviews', '.zab']
     return folder_name.lower() in junk
 
 def get_candidates(force_refresh=False):
     """
-    SMART AGGREGATION SCANNER
+    STRICT SCANNER:
+    1. Ignores any folder that contains SUB-FOLDERS (assumes it's a Collection/Author folder).
+    2. Aggregates "CD 1", "Disc 2" into parent.
+    3. Ignores Junk.
     """
     history = load_json(HISTORY_FILE, [])
     library_map = get_library_map(force_refresh)
@@ -84,12 +78,9 @@ def get_candidates(force_refresh=False):
     if not os.path.exists(DOWNLOAD_DIR):
         return []
 
-    # 1. Identify all "Audio Roots"
-    # We use a Dictionary to prevent duplicates. Key=Path, Value=Data
     candidate_map = {} 
 
     for root, dirs, files in os.walk(DOWNLOAD_DIR):
-        # Does this folder have audio?
         audio_files = [f for f in files if f.lower().endswith(('.mp3', '.m4b', '.m4a', '.flac'))]
         
         if audio_files:
@@ -97,34 +88,46 @@ def get_candidates(force_refresh=False):
             parent_path = os.path.dirname(root)
             parent_name = os.path.basename(parent_path)
             
-            # --- AGGREGATION LOGIC ---
+            # --- STRICT FILTERING ---
             
-            # 1. Skip Junk
+            # 1. Skip if Junk
             if is_junk_folder(folder_name):
                 continue
-                
-            # 2. Check for "Part" folders (CD 1, Disc 2, etc)
+
+            # 2. Skip if this folder contains sub-directories (It's a Container/Collection)
+            # Exception: Unless the sub-directories are just "metadata" folders like .zab or artwork
+            has_real_subfolders = False
+            for d in dirs:
+                if not d.startswith('.'): # Ignore hidden folders
+                    has_real_subfolders = True
+                    break
+            
+            if has_real_subfolders:
+                # This folder has audio files BUT also has subfolders. 
+                # It is likely a messy parent folder (e.g. Author Folder with loose files + Book folders).
+                # We SKIP it to encourage processing the sub-folders instead.
+                continue
+
+            # 3. Handle CD/Part Aggregation
             target_path = root
             target_name = folder_name
             
             if is_part_folder(folder_name):
-                # Bubbling Up: This is "CD 1", so the real book is the Parent.
                 target_path = parent_path
                 target_name = parent_name
-                # Safety: If the parent is the Download Root itself, we can't bubble up.
+                # Safety: Don't bubble up to root
                 if os.path.abspath(target_path) == os.path.abspath(DOWNLOAD_DIR):
                     target_path = root
                     target_name = folder_name
             
-            # 3. Add to map (This handles deduplication automatically)
-            # If we find "CD 1" and "CD 2", both bubble up to "BookName", overwriting the same key.
+            # Add to map
             if target_path not in candidate_map:
                 candidate_map[target_path] = {
                     "path": target_path,
                     "name": target_name
                 }
 
-    # 2. Process Status for Unique Candidates
+    # Process Status
     final_list = []
     
     for path, data in candidate_map.items():
@@ -135,21 +138,17 @@ def get_candidates(force_refresh=False):
         display_prefix = ""
         match_path = None
         
-        # Check History
         if full_path in history:
             status = 3
             display_prefix = "✅ (History) "
-
-        # Check Library Map
         elif folder_name in library_map:
             lib_path = library_map[folder_name]
             match_path = lib_path
-            
             if os.path.exists(os.path.join(lib_path, "metadata.json")):
-                status = 2 # Green
+                status = 2 
                 display_prefix = "✅ "
             else:
-                status = 1 # Yellow
+                status = 1 
                 display_prefix = "🟨 "
         
         final_list.append({
@@ -165,12 +164,14 @@ def get_candidates(force_refresh=False):
 
 def fetch_metadata(query):
     try:
+        # Added User-Agent to avoid some API blocks
+        headers = {'User-Agent': 'TidyBooks/1.0'}
         params = {'q': query}
-        r = requests.get(AUDNEXUS_API, params=params, timeout=10)
+        r = requests.get(AUDNEXUS_API, params=params, headers=headers, timeout=10)
         if r.status_code == 200:
             return r.json()
     except Exception as e:
-        st.error(f"Connection Error: {e}")
+        st.error(f"API Error: {e}")
     return []
 
 def tag_file(file_path, author, title, series, desc, cover_url, year, track_num, total_tracks):
@@ -229,7 +230,6 @@ def process_selection(source_data, author, title, series, series_part, desc, cov
     os.makedirs(dest_base_folder, exist_ok=True)
 
     files_to_process = []
-    # Recursively find all audio files in the target path
     for root, _, files in os.walk(working_source_path):
         for file in files:
             if file.lower().endswith(('.mp3', '.m4b', '.m4a', '.flac')):
@@ -338,7 +338,6 @@ with col2:
             c_search, c_btn = st.columns([3,1])
             with c_search:
                 clean_guess = folder_name.replace("_", " ").replace("-", " ")
-                # Extra cleaning for CD/Part numbers in the search string
                 clean_guess = re.sub(r'\b(cd|disc|part)\s*\d+\b', '', clean_guess, flags=re.IGNORECASE)
                 search_query = st.text_input("Search Title", value=clean_guess)
             with c_btn:
