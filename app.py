@@ -52,12 +52,10 @@ def save_json(filepath, data):
 def sanitize_for_matching(text):
     if not text: return ""
     text = text.lower()
-    # Remove common filler words
     text = re.sub(r'\b(audiobook|mp3|m4b|cd|disc|part|v|vol|chapter)\b', '', text)
-    # KEEP a-z AND 0-9. Remove everything else.
     text = re.sub(r'[^a-z0-9]', '', text) 
     return text
-    
+
 def sanitize_filename(name):
     if not name: return "Unknown"
     clean = name.replace("/", "-").replace("\\", "-")
@@ -160,20 +158,14 @@ def scan_downloads_snapshot():
     return candidates
 
 def get_candidates_with_status():
-    # 1. Get Auto-Scanned Items (Cached)
     raw_candidates = scan_downloads_snapshot()
-    
-    # 2. Get Manually Created Items (from Session State)
     manual_items = st.session_state.get('manual_books', [])
     all_candidates = manual_items + raw_candidates
     
     history = load_json(HISTORY_FILE, [])
     
-    # LOAD LIBRARY CACHE ONCE (Critical for speed)
-    # If cache is empty, we scan once.
     cached_lib = load_json(CACHE_FILE, [])
-    if not cached_lib: 
-        cached_lib = scan_library_now()
+    if not cached_lib: cached_lib = scan_library_now()
     library_items = cached_lib
     
     final_list = []
@@ -181,25 +173,19 @@ def get_candidates_with_status():
     for data in all_candidates:
         unique_id = data['id']
         path_str = data['path']
-        # Recalculate clean name here to be safe
-        clean_dl = sanitize_for_matching(data['name'])
-        
+        clean_dl = data['clean']
         status = 0 
         match_path = None
         
-        # Check History
+        # Status 3: History
         if unique_id in history or path_str in history:
             status = 3
-        
-        # Check Library Match
+        # Status 1: Match Found in Library
         elif library_items:
             for lib_item in library_items:
                 clean_lib = lib_item.get('clean')
                 if not clean_lib: continue
-                
-                # MATCH LOGIC FIX:
-                # 1. Allow numbers (handled by new sanitize function)
-                # 2. Lower threshold to 2 chars (for short titles like "It" or "1984")
+                # Match logic: allow numbers, length > 2
                 if len(clean_lib) > 2 and (clean_lib in clean_dl or clean_dl in clean_lib):
                     match_path = lib_item['path']
                     status = 1
@@ -213,19 +199,15 @@ def get_candidates_with_status():
         if data.get('is_manual'): display_name = f"🛠️ {display_name}"
         
         final_list.append({
-            "path": data['path'], 
-            "unique_id": unique_id,
-            "name": display_name, 
-            "raw_name": data['name'],
-            "status_code": status, 
-            "State": status_icon, 
-            "match_path": match_path, 
-            "file_list": data['file_list'],
+            "path": data['path'], "unique_id": unique_id,
+            "name": display_name, "raw_name": data['name'],
+            "status_code": status, "State": status_icon, 
+            "match_path": match_path, "file_list": data['file_list'],
             "is_manual": data.get('is_manual', False)
         })
 
     return sorted(final_list, key=lambda x: (x['status_code'] > 0, natural_keys(x['raw_name'])))
-    
+
 # --- SEARCH ---
 def fetch_metadata(query, provider):
     results = []
@@ -256,6 +238,10 @@ def fetch_metadata(query, provider):
     except: pass
     return results
 
+def fetch_metadata_router(query, provider):
+    if provider == "Apple Books": return fetch_metadata(query, "Apple Books")
+    return fetch_metadata(query, "Google Books")
+
 # --- PROCESSING ---
 def tag_file(file_path, author, title, series, desc, cover_url, year, track_num, total_tracks):
     ext = os.path.splitext(file_path)[1].lower()
@@ -285,17 +271,26 @@ def tag_file(file_path, author, title, series, desc, cover_url, year, track_num,
     except: pass
 
 def process_selection(source_data, author, title, series, series_part, desc, cover_url, narrator, publish_year, target_override=None):
-    mode = "COPY"
     files_to_process = source_data['file_list']
     
-    # Check if we are merging/fixing
+    # --- MERGE/FIX MODE LOGIC ---
     if target_override:
-        mode = "MERGE"
         dest_base = target_override
-        # Logic: If merging, we don't create new folders based on Author/Title
-        # We assume target_override IS the book folder.
+        # NEW: Clean the destination folder first to prevent double copies.
+        # We wipe it so we can replace the "messy" version with the "clean" version.
+        try:
+            # We iterate and delete contents, preserving the folder itself
+            for filename in os.listdir(dest_base):
+                file_path = os.path.join(dest_base, filename)
+                if os.path.isfile(file_path) or os.path.islink(file_path):
+                    os.unlink(file_path)
+                elif os.path.isdir(file_path):
+                    shutil.rmtree(file_path)
+        except Exception as e:
+            st.error(f"Error cleaning destination: {e}")
+            return # Stop to be safe
     else:
-        # Standard Import
+        # Standard Import (New Folder)
         clean_author = sanitize_filename(author)
         clean_title = sanitize_filename(title)
         clean_series = sanitize_filename(series)
@@ -312,22 +307,12 @@ def process_selection(source_data, author, title, series, series_part, desc, cov
         name = f"{str(i+1).zfill(pad)} - {sanitize_filename(title)}{ext}"
         dst = os.path.join(dest_base, name)
         
-        # For MERGE mode, we move/overwrite. For standard, we copy.
-        if mode == "MERGE":
-            shutil.move(src, dst)
-        else:
-            shutil.copy2(src, dst)
+        # --- CRITICAL: ALWAYS COPY (NEVER MOVE) ---
+        # Because source is Read-Only torrent folder
+        shutil.copy2(src, dst)
             
         tag_file(dst, author, title, series, desc, cover_url, publish_year, i+1, total)
         bar.progress((i+1)/total)
-
-    # Cleanup source if we moved everything (Merge Mode)
-    if mode == "MERGE":
-        try:
-            # Only remove if empty
-            if not os.listdir(source_data['path']):
-                shutil.rmtree(source_data['path'])
-        except: pass
 
     # Create Metadata
     abs_meta = {
