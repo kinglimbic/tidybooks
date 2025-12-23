@@ -15,7 +15,7 @@ DOWNLOAD_DIR = "/downloads"
 LIBRARY_DIR = "/audiobooks"
 DATA_DIR = "/app/data"
 HISTORY_FILE = os.path.join(DATA_DIR, "processed_log.json")
-CACHE_FILE = os.path.join(DATA_DIR, "library_map_cache.json") # Renamed for clarity
+CACHE_FILE = os.path.join(DATA_DIR, "library_map_cache.json")
 AUDNEXUS_API = "https://api.audnexus.com/books"
 
 os.makedirs(DATA_DIR, exist_ok=True)
@@ -36,7 +36,6 @@ def save_json(filepath, data):
 def get_library_map(force_refresh=False):
     """
     Returns a dictionary: { "FolderName": "/full/path/to/folder/in/library" }
-    Scans RECURSIVELY to find books nested in Author/Series folders.
     """
     if not force_refresh:
         cached = load_json(CACHE_FILE)
@@ -44,13 +43,9 @@ def get_library_map(force_refresh=False):
             
     try:
         library_map = {}
-        # Deep scan of the library
         for root, dirs, files in os.walk(LIBRARY_DIR):
             folder_name = os.path.basename(root)
-            # We map the folder name to its full path
-            # If duplicates exist, this takes the last one found (acceptable limitation)
             library_map[folder_name] = root
-        
         save_json(CACHE_FILE, library_map)
         return library_map
     except:
@@ -62,59 +57,111 @@ def sanitize_filename(name):
     clean = name.replace("/", "-").replace("\\", "-")
     return re.sub(r'[<>:"|?*]', '', clean).strip()
 
+def is_part_folder(folder_name):
+    """
+    Returns True if the folder name looks like 'CD 1', 'Disc 2', 'Part 1', '3', etc.
+    """
+    # Regex for CD 1, Disc 02, Disk A, Part IV, Vol 1, or just digits like "1", "02"
+    pattern = r"^(cd|disc|disk|part|vol|volume|chapter)\s*[\d\w]+$"
+    simple_digit = r"^\d+$"
+    
+    if re.match(pattern, folder_name, re.IGNORECASE) or re.match(simple_digit, folder_name):
+        return True
+    return False
+
+def is_junk_folder(folder_name):
+    """Returns True if this is likely a Sample or Extras folder."""
+    junk = ['sample', 'samples', 'extra', 'extras', 'proof', 'interview', 'interviews']
+    return folder_name.lower() in junk
+
 def get_candidates(force_refresh=False):
+    """
+    SMART AGGREGATION SCANNER
+    """
     history = load_json(HISTORY_FILE, [])
-    candidates = []
+    library_map = get_library_map(force_refresh)
     
     if not os.path.exists(DOWNLOAD_DIR):
         return []
 
-    # Get the Deep Map of the library
-    library_map = get_library_map(force_refresh)
+    # 1. Identify all "Audio Roots"
+    # We use a Dictionary to prevent duplicates. Key=Path, Value=Data
+    candidate_map = {} 
 
     for root, dirs, files in os.walk(DOWNLOAD_DIR):
-        # Look for audio files
+        # Does this folder have audio?
         audio_files = [f for f in files if f.lower().endswith(('.mp3', '.m4b', '.m4a', '.flac'))]
         
         if audio_files:
-            full_path = root
             folder_name = os.path.basename(root)
+            parent_path = os.path.dirname(root)
+            parent_name = os.path.basename(parent_path)
             
-            # --- STATUS LOGIC ---
-            status = 0 # Default: New/White
-            display_prefix = ""
-            match_path = None
+            # --- AGGREGATION LOGIC ---
             
-            # 1. Check if this exact download path was processed by us previously
-            if full_path in history:
-                status = 3 # Special "Hidden/Bottom" status for History
-                display_prefix = "✅ (History) "
-
-            # 2. Check the Library Map for a folder with the same name
-            elif folder_name in library_map:
-                lib_path = library_map[folder_name]
-                match_path = lib_path
+            # 1. Skip Junk
+            if is_junk_folder(folder_name):
+                continue
                 
-                # Check for metadata.json to determine Green vs Yellow
-                if os.path.exists(os.path.join(lib_path, "metadata.json")):
-                    status = 2 # Green (Properly Tidy)
-                    display_prefix = "✅ "
-                else:
-                    status = 1 # Yellow (Exists, but maybe messy)
-                    display_prefix = "🟨 "
+            # 2. Check for "Part" folders (CD 1, Disc 2, etc)
+            target_path = root
+            target_name = folder_name
             
-            candidates.append({
-                "label": f"{display_prefix}{folder_name}",
-                "path": full_path,
-                "type": "dir",
-                "status": status,
-                "match_path": match_path,
-                "name": folder_name
-            })
+            if is_part_folder(folder_name):
+                # Bubbling Up: This is "CD 1", so the real book is the Parent.
+                target_path = parent_path
+                target_name = parent_name
+                # Safety: If the parent is the Download Root itself, we can't bubble up.
+                if os.path.abspath(target_path) == os.path.abspath(DOWNLOAD_DIR):
+                    target_path = root
+                    target_name = folder_name
+            
+            # 3. Add to map (This handles deduplication automatically)
+            # If we find "CD 1" and "CD 2", both bubble up to "BookName", overwriting the same key.
+            if target_path not in candidate_map:
+                candidate_map[target_path] = {
+                    "path": target_path,
+                    "name": target_name
+                }
 
-    # Sort Order: 
-    # 0 (New/White) -> 1 (Yellow) -> 2 (Green) -> 3 (History)
-    return sorted(candidates, key=lambda x: (x['status'], x['name']))
+    # 2. Process Status for Unique Candidates
+    final_list = []
+    
+    for path, data in candidate_map.items():
+        folder_name = data['name']
+        full_path = data['path']
+        
+        status = 0 
+        display_prefix = ""
+        match_path = None
+        
+        # Check History
+        if full_path in history:
+            status = 3
+            display_prefix = "✅ (History) "
+
+        # Check Library Map
+        elif folder_name in library_map:
+            lib_path = library_map[folder_name]
+            match_path = lib_path
+            
+            if os.path.exists(os.path.join(lib_path, "metadata.json")):
+                status = 2 # Green
+                display_prefix = "✅ "
+            else:
+                status = 1 # Yellow
+                display_prefix = "🟨 "
+        
+        final_list.append({
+            "label": f"{display_prefix}{folder_name}",
+            "path": full_path,
+            "type": "dir",
+            "status": status,
+            "match_path": match_path,
+            "name": folder_name
+        })
+
+    return sorted(final_list, key=lambda x: (x['status'], x['name']))
 
 def fetch_metadata(query):
     try:
@@ -166,8 +213,6 @@ def process_selection(source_data, author, title, series, series_part, desc, cov
     mode = "COPY"
     working_source_path = source_data['path']
     
-    # Logic: If Yellow (Status 1), we FIX (Move). 
-    # If Green (Status 2), we usually leave it alone, but user can re-import if they want.
     if source_data['status'] == 1 and source_data['match_path']:
         mode = "FIX"
         working_source_path = source_data['match_path']
@@ -184,6 +229,7 @@ def process_selection(source_data, author, title, series, series_part, desc, cov
     os.makedirs(dest_base_folder, exist_ok=True)
 
     files_to_process = []
+    # Recursively find all audio files in the target path
     for root, _, files in os.walk(working_source_path):
         for file in files:
             if file.lower().endswith(('.mp3', '.m4b', '.m4a', '.flac')):
@@ -238,7 +284,6 @@ def process_selection(source_data, author, title, series, series_part, desc, cov
     with open(os.path.join(dest_base_folder, "metadata.json"), 'w', encoding='utf-8') as f:
         json.dump(abs_metadata, f, indent=4)
 
-    # Update History and Clear Cache
     history = load_json(HISTORY_FILE, [])
     if source_data['path'] not in history:
         history.append(source_data['path'])
@@ -280,11 +325,11 @@ with col2:
         folder_name = selected_item['name']
         
         if selected_item['status'] == 2:
-            st.success(f"✅ **Properly Imported:** Found in Library with valid metadata.")
+            st.success(f"✅ **Properly Imported:** Found in Library.")
         elif selected_item['status'] == 1:
-            st.warning(f"🟨 **Messy Copy Found:** A folder named '{folder_name}' exists in Library but lacks TidyBooks metadata.")
+            st.warning(f"🟨 **Messy Copy Found:** '{folder_name}' exists in Library but looks untidy.")
         elif selected_item['status'] == 3:
-             st.success("✅ **In History:** You have processed this specific download before.")
+             st.success("✅ **In History:** Previously processed.")
 
         st.subheader("✏️ Book Details")
         st.caption(f"Folder: `{folder_name}`")
@@ -293,6 +338,8 @@ with col2:
             c_search, c_btn = st.columns([3,1])
             with c_search:
                 clean_guess = folder_name.replace("_", " ").replace("-", " ")
+                # Extra cleaning for CD/Part numbers in the search string
+                clean_guess = re.sub(r'\b(cd|disc|part)\s*\d+\b', '', clean_guess, flags=re.IGNORECASE)
                 search_query = st.text_input("Search Title", value=clean_guess)
             with c_btn:
                 st.write("##")
