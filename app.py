@@ -25,9 +25,17 @@ os.makedirs(DATA_DIR, exist_ok=True)
 st.set_page_config(page_title="TidyBooks", layout="wide", page_icon="📚")
 
 # --- Initialize Session State ---
+default_keys = ['form_auth', 'form_title', 'form_narr', 'form_series', 'form_part', 'form_year', 'form_desc', 'form_img']
+for key in default_keys:
+    if key not in st.session_state: st.session_state[key] = ""
+
 if 'exp_path' not in st.session_state: st.session_state['exp_path'] = DOWNLOAD_DIR
+if 'sync_selection' not in st.session_state: st.session_state['sync_selection'] = None
+if 'current_selection_data' not in st.session_state: st.session_state['current_selection_data'] = None
 if 'search_provider' not in st.session_state: st.session_state['search_provider'] = "Apple Books"
-if 'last_processed' not in st.session_state: st.session_state['last_processed'] = None
+if 'last_jumped_path' not in st.session_state: st.session_state['last_jumped_path'] = None
+# Stores manually created bundles
+if 'manual_books' not in st.session_state: st.session_state['manual_books'] = []
 
 # --- Persistence ---
 def load_json(filepath, default=None):
@@ -41,10 +49,22 @@ def save_json(filepath, data):
     with open(filepath, 'w') as f: json.dump(data, f)
 
 # --- Helper Functions ---
+def sanitize_for_matching(text):
+    if not text: return ""
+    text = text.lower()
+    text = re.sub(r'\b(audiobook|mp3|m4b|cd|disc|part|v|vol|chapter)\b', '', text)
+    text = re.sub(r'[^a-z]', '', text) 
+    return text
+
 def sanitize_filename(name):
     if not name: return "Unknown"
     clean = name.replace("/", "-").replace("\\", "-")
-    return re.sub(r'[<>:"|?*]', '', clean).strip()
+    clean = re.sub(r'[<>:"|?*]', '', clean).strip()
+    return "Unknown" if not clean else clean
+
+def is_junk_folder(folder_name):
+    junk = ['sample', 'samples', 'extra', 'extras', 'proof', 'interview', 'interviews', '.zab', 'artwork']
+    return folder_name.lower() in junk
 
 def clean_search_query(text):
     text = re.sub(r'[\(\[\{].*?[\)\]\}]', '', text)
@@ -53,52 +73,138 @@ def clean_search_query(text):
     text = text.replace('.', ' ').replace('_', ' ').replace('-', ' ')
     return re.sub(r'\s+', ' ', text).strip()
 
+def get_file_stem(filename):
+    name = os.path.splitext(filename)[0].lower()
+    name = re.sub(r'[\(\[\{].*?[\)\]\}]', ' ', name)
+    name = re.sub(r'\b(part|pt|cd|disc|disk|track|chapter|vol|volume)\s*\d+\b', ' ', name)
+    name = re.sub(r'[_\-\.]', ' ', name)
+    name = re.sub(r'\b\d+\b', ' ', name)
+    return re.sub(r'\s+', ' ', name).strip()
+
 def natural_keys(text):
     return [int(c) if c.isdigit() else c.lower() for c in re.split(r'(\d+)', text)]
 
-# --- Caching & Scanning ---
+# --- Cached Operations ---
 def scan_library_now():
-    """ Updates the list of what is already in the library """
     library_items = []
     for root, dirs, files in os.walk(LIBRARY_DIR):
         has_audio = any(f.lower().endswith(('.mp3', '.m4b', '.m4a', '.flac')) for f in files)
         if has_audio:
-            library_items.append({"path": root, "name": os.path.basename(root)})
+            folder_name = os.path.basename(root)
+            library_items.append({
+                "name": folder_name,
+                "path": root,
+                "clean": sanitize_for_matching(folder_name)
+            })
     save_json(CACHE_FILE, library_items)
     return library_items
 
 @st.cache_data(ttl=600, show_spinner="Scanning downloads...")
-def get_auto_queue():
-    """ Standard Scanner: 1 Folder = 1 Book """
+def scan_downloads_snapshot():
     if not os.path.exists(DOWNLOAD_DIR): return []
-    candidates = []
     
+    candidates = []
+    seen_ids = set() 
+
     for root, dirs, files in os.walk(DOWNLOAD_DIR):
         audio_files = [f for f in files if f.lower().endswith(('.mp3', '.m4b', '.m4a', '.flac'))]
+        
         if audio_files:
-            # Skip if junk folder
-            if any(x in root.lower() for x in ['sample', 'artwork', '.zab']): continue
-            
-            # Skip if parent folder has audio subfolders (don't double count)
-            has_subfolders = any(not d.startswith('.') for d in dirs)
-            if has_subfolders: continue
-
-            # Standard: Folder Name is Book Name
             folder_name = os.path.basename(root)
-            full_paths = [os.path.join(root, f) for f in audio_files]
+            if is_junk_folder(folder_name): continue
             
-            candidates.append({
-                "type": "auto",
-                "name": folder_name,
-                "path": root,
-                "file_list": full_paths,
-                "count": len(full_paths)
-            })
-    
-    # Sort Natural
-    return sorted(candidates, key=lambda x: natural_keys(x['name']))
+            # 1. Collection Logic
+            if "collection" in folder_name.lower():
+                groups = {}
+                for f in audio_files:
+                    stem = get_file_stem(f)
+                    if not stem: stem = "unknown"
+                    if stem not in groups: groups[stem] = []
+                    groups[stem].append(f)
+                
+                for stem, file_list in groups.items():
+                    unique_id = f"{root}|{stem}"
+                    display_name = stem.title()
+                    full_paths = [os.path.join(root, f) for f in file_list]
+                    candidates.append({
+                        "id": unique_id, "path": root, "name": display_name,
+                        "clean": sanitize_for_matching(display_name),
+                        "file_list": full_paths, "is_group": True 
+                    })
+            # 2. Standard Logic
+            else:
+                has_real_subfolders = any(not d.startswith('.') for d in dirs)
+                if has_real_subfolders: continue 
 
-# --- APIs ---
+                target_path = root
+                target_name = folder_name
+                parent_path = os.path.dirname(root)
+                
+                if re.match(r'^(cd|disc|part|vol|chapter)?\s*\d+$', folder_name, re.IGNORECASE):
+                     if os.path.abspath(parent_path) != os.path.abspath(DOWNLOAD_DIR):
+                         target_path = parent_path
+                         target_name = os.path.basename(parent_path)
+
+                unique_id = f"{target_path}|FOLDER"
+                
+                if unique_id not in seen_ids:
+                    seen_ids.add(unique_id)
+                    all_paths = [os.path.join(root, f) for f in audio_files]
+                    candidates.append({
+                        "id": unique_id, "path": target_path, "name": target_name,
+                        "clean": sanitize_for_matching(target_name),
+                        "file_list": all_paths, "is_group": False
+                    })
+    return candidates
+
+def get_candidates_with_status():
+    raw_candidates = scan_downloads_snapshot()
+    manual_items = st.session_state.get('manual_books', [])
+    all_candidates = manual_items + raw_candidates
+    
+    history = load_json(HISTORY_FILE, [])
+    cached_lib = load_json(CACHE_FILE, None)
+    library_items = cached_lib if (cached_lib and isinstance(cached_lib, list)) else []
+    
+    final_list = []
+    
+    for data in all_candidates:
+        unique_id = data['id']
+        clean_dl = data['clean']
+        status = 0 
+        match_path = None
+        
+        if unique_id in history:
+            status = 3
+        elif library_items:
+            for lib_item in library_items:
+                clean_lib = lib_item.get('clean')
+                if not clean_lib: continue
+                if len(clean_lib) > 4 and (clean_lib in clean_dl or clean_dl in clean_lib):
+                    match_path = lib_item['path']
+                    if os.path.exists(os.path.join(match_path, "metadata.json")): status = 2
+                    else: status = 1
+                    break
+        
+        status_icon = "⚪"
+        if status == 3: status_icon = "✅"
+        elif status == 2: status_icon = "✅"
+        elif status == 1: status_icon = "🟡"
+        
+        display_name = data['name']
+        if data.get('is_manual'): display_name = f"🛠️ {display_name}"
+        
+        final_list.append({
+            "path": data['path'], "unique_id": unique_id,
+            "name": display_name, "raw_name": data['name'],
+            "status_code": status, "State": status_icon, 
+            "match_path": match_path, "file_list": data['file_list'],
+            "is_manual": data.get('is_manual', False)
+        })
+
+    return sorted(final_list, key=lambda x: (x['status_code'] > 0, natural_keys(x['raw_name'])))
+
+# --- SEARCH ---
 def fetch_metadata(query, provider):
     results = []
     try:
@@ -108,13 +214,9 @@ def fetch_metadata(query, provider):
                 for item in r.json().get('results', []):
                     img = item.get('artworkUrl100', '').replace('100x100', '600x600')
                     results.append({
-                        "title": item.get('collectionName'),
-                        "authors": item.get('artistName'),
-                        "narrators": "",
-                        "series": "", "part": "",
-                        "year": item.get('releaseDate', '')[:4],
-                        "desc": item.get('description', ''),
-                        "img": img
+                        "title": item.get('collectionName'), "authors": item.get('artistName'),
+                        "narrators": "", "series": "", "part": "", "summary": item.get('description', ''),
+                        "image": img, "releaseDate": item.get('releaseDate', '')
                     })
         else: # Google
             r = requests.get(GOOGLE_BOOKS_API, params={"q": query, "maxResults": 10, "langRestrict": "en"}, timeout=5)
@@ -124,357 +226,305 @@ def fetch_metadata(query, provider):
                     img = info.get('imageLinks', {}).get('thumbnail', '').replace('http:', 'https:')
                     auths = info.get('authors', [])
                     results.append({
-                        "title": info.get('title'),
-                        "authors": auths[0] if auths else "",
+                        "title": info.get('title'), "authors": auths[0] if auths else "",
                         "narrators": ", ".join(auths[1:]) if len(auths)>1 else "",
-                        "series": "", "part": "",
-                        "year": info.get('publishedDate', '')[:4],
-                        "desc": info.get('description', ''),
-                        "img": img
+                        "series": "", "part": "", "summary": info.get('description', ''),
+                        "image": img, "releaseDate": info.get('publishedDate', '')
                     })
     except: pass
     return results
 
-# --- Processing Engine ---
-def process_book(file_list, meta):
-    """ Moves files, Tags them, Creates Metadata.json """
-    # 1. Prepare Destination
-    clean_auth = sanitize_filename(meta['authors'])
-    clean_title = sanitize_filename(meta['title'])
-    clean_series = sanitize_filename(meta['series'])
-    
-    if clean_series:
-        dest_dir = os.path.join(LIBRARY_DIR, clean_auth, clean_series, clean_title)
-    else:
-        dest_dir = os.path.join(LIBRARY_DIR, clean_auth, clean_title)
-    
-    os.makedirs(dest_dir, exist_ok=True)
+# --- PROCESSING ---
+def tag_file(file_path, author, title, series, desc, cover_url, year, track_num, total_tracks):
+    ext = os.path.splitext(file_path)[1].lower()
+    try:
+        if ext in ['.m4b', '.m4a']:
+            audio = MP4(file_path)
+            if audio.tags is None: audio.add_tags()
+            audio.tags['\xa9nam'] = title; audio.tags['\xa9ART'] = author
+            audio.tags['\xa9alb'] = series if series else title; audio.tags['desc'] = desc
+            audio.tags['trkn'] = [(track_num, total_tracks)]
+            if year: audio.tags['\xa9day'] = year
+            if cover_url:
+                try: audio.tags['covr'] = [MP4Cover(requests.get(cover_url).content, imageformat=MP4Cover.FORMAT_JPEG)]
+                except: pass
+            audio.save()
+        elif ext == '.mp3':
+            try: audio = ID3(file_path) 
+            except: audio = ID3()
+            audio.add(TIT2(encoding=3, text=title)); audio.add(TPE1(encoding=3, text=author))
+            audio.add(TALB(encoding=3, text=series if series else title))
+            audio.add(TRCK(encoding=3, text=f"{track_num}/{total_tracks}"))
+            if desc: audio.add(COMM(encoding=3, lang='eng', desc='Description', text=desc))
+            if cover_url:
+                try: audio.add(APIC(3, 'image/jpeg', 3, 'Front Cover', requests.get(cover_url).content))
+                except: pass
+            audio.save(file_path)
+    except: pass
 
-    # 2. Move & Tag Files
-    file_list.sort()
-    total = len(file_list)
+def process_selection(source_data, author, title, series, series_part, desc, cover_url, narrator, publish_year):
+    mode = "COPY"
+    files_to_process = source_data['file_list']
     
-    # Progress Bar in Sidebar to not clutter UI
-    prog = st.sidebar.progress(0, text="Processing...")
+    if source_data['status_code'] == 1 and source_data['match_path']:
+        mode = "FIX"
+        working_source_path = source_data['match_path']
+        files_to_process = []
+        for root, _, fs in os.walk(working_source_path):
+            for f in fs:
+                if f.lower().endswith(('.mp3', '.m4b', '.m4a', '.flac')):
+                    files_to_process.append(os.path.join(root, f))
+
+    clean_author = sanitize_filename(author)
+    clean_title = sanitize_filename(title)
+    clean_series = sanitize_filename(series)
     
-    for i, src in enumerate(file_list):
+    dest_base = os.path.join(LIBRARY_DIR, clean_author, clean_series, clean_title) if clean_series else os.path.join(LIBRARY_DIR, clean_author, clean_title)
+    os.makedirs(dest_base, exist_ok=True)
+
+    files_to_process.sort()
+    total = len(files_to_process)
+    
+    bar = st.progress(0)
+    for i, src in enumerate(files_to_process):
         ext = os.path.splitext(src)[1]
+        name = f"{str(i+1).zfill(max(2, len(str(total))))} - {clean_title}{ext}"
+        dst = os.path.join(dest_base, name)
         
-        # New Filename: "01 - Title.mp3" or just "Title.mp3"
-        if total > 1:
-            track_str = str(i+1).zfill(len(str(total)))
-            new_name = f"{track_str} - {clean_title}{ext}"
-        else:
-            new_name = f"{clean_title}{ext}"
-            
-        dst = os.path.join(dest_dir, new_name)
-        
-        # COPY (Safety First)
-        shutil.copy2(src, dst)
-        
-        # TAG
-        try:
-            if ext in ['.m4b', '.m4a']:
-                audio = MP4(dst)
-                if audio.tags is None: audio.add_tags()
-                audio.tags['\xa9nam'] = meta['title']; audio.tags['\xa9ART'] = meta['authors']
-                audio.tags['\xa9alb'] = meta['series'] if meta['series'] else meta['title']
-                audio.tags['desc'] = meta['desc']; audio.tags['trkn'] = [(i+1, total)]
-                if meta['year']: audio.tags['\xa9day'] = meta['year']
-                if meta['img']: 
-                    try: audio.tags['covr'] = [MP4Cover(requests.get(meta['img']).content, imageformat=MP4Cover.FORMAT_JPEG)]
-                    except: pass
-                audio.save()
-            elif ext == '.mp3':
-                try: audio = ID3(dst) 
-                except: audio = ID3()
-                audio.add(TIT2(encoding=3, text=meta['title']))
-                audio.add(TPE1(encoding=3, text=meta['authors']))
-                audio.add(TALB(encoding=3, text=meta['series'] if meta['series'] else meta['title']))
-                audio.add(TRCK(encoding=3, text=f"{i+1}/{total}"))
-                if meta['desc']: audio.add(COMM(encoding=3, lang='eng', desc='Description', text=meta['desc']))
-                if meta['img']:
-                    try: audio.add(APIC(3, 'image/jpeg', 3, 'Front Cover', requests.get(meta['img']).content))
-                    except: pass
-                audio.save(dst)
+        if mode == "FIX" and os.path.abspath(src) != os.path.abspath(dst): shutil.move(src, dst)
+        else: shutil.copy2(src, dst)
+        tag_file(dst, author, title, series, desc, cover_url, publish_year, i+1, total)
+        bar.progress((i+1)/total)
+
+    if mode == "FIX" and source_data.get('match_path'): 
+        try: shutil.rmtree(source_data['match_path']) 
         except: pass
-        
-        prog.progress((i+1)/total)
 
-    # 3. Create JSON
-    json_data = {
-        "title": meta['title'],
-        "authors": [meta['authors']],
-        "series": [meta['series']] if meta['series'] else [],
-        "narrators": [meta['narrators']] if meta['narrators'] else [],
-        "description": meta['desc'],
-        "publishYear": meta['year'],
-        "cover": meta['img']
+    abs_meta = {
+        "title": title, "authors": [author], "series": [series] if series else [],
+        "description": desc, "narrators": [narrator] if narrator else [],
+        "publishYear": publish_year, "cover": cover_url
     }
-    
-    # Handle Series Sequence
-    if meta['series'] and meta['part']:
-        json_data["series"] = [{"sequence": meta['part'], "name": meta['series']}]
+    if series and series_part:
+        try: abs_meta["series"] = [{"sequence": series_part, "name": series}]
+        except: abs_meta["series"] = [series]
 
-    with open(os.path.join(dest_dir, "metadata.json"), 'w') as f:
-        json.dump(json_data, f, indent=4)
+    with open(os.path.join(dest_base, "metadata.json"), 'w') as f: json.dump(abs_meta, f, indent=4)
 
-    # 4. Update History (Log the SOURCE path to prevent re-scan)
-    # If it came from a folder, log the folder. If files, log the parent folder.
-    parent_folder = os.path.dirname(file_list[0])
-    
     hist = load_json(HISTORY_FILE, [])
-    if parent_folder not in hist:
-        hist.append(parent_folder)
+    if source_data['unique_id'] not in hist:
+        hist.append(source_data['unique_id'])
         save_json(HISTORY_FILE, hist)
-
-    prog.empty()
-    return clean_title
-
-# --- UI LAYOUT ---
-col_src, col_edit, col_lib = st.columns([1.2, 1.2, 0.8])
-
-# ==========================================
-# 1. LEFT COLUMN: SOURCES (Queue & Explorer)
-# ==========================================
-with col_src:
-    tab_queue, tab_ex = st.tabs(["🕵️ Untidy Queue", "📂 File Explorer"])
     
-    # --- TAB 1: AUTO QUEUE ---
-    with tab_queue:
-        # Filter history
-        hist = load_json(HISTORY_FILE, [])
-        all_found = get_auto_queue()
-        # Filter out what's in history
-        queue_items = [x for x in all_found if x['path'] not in hist]
-        
-        if not queue_items:
-            st.info("Queue is empty! (Everything imported?)")
-            selected_queue = None
+    if source_data.get('is_manual'):
+        st.session_state['manual_books'] = [b for b in st.session_state['manual_books'] if b['id'] != source_data['unique_id']]
+
+    st.success(f"✅ Done: {clean_title}")
+    st.cache_data.clear()
+    st.session_state['current_selection_data'] = None
+    time.sleep(1)
+    st.rerun()
+
+# --- MAIN LAYOUT (3 Columns) ---
+# Column 1: Queue | Column 2: Editor | Column 3: Explorer
+col1, col2, col3 = st.columns([1.5, 2, 1.5])
+
+# ==================== COLUMN 1: QUEUE & LISTS ====================
+all_items = get_candidates_with_status()
+new_items = [x for x in all_items if x['status_code'] == 0]
+existing_items = [x for x in all_items if x['status_code'] > 0]
+
+# Sync: Explorer -> Queue
+if st.session_state['sync_selection']:
+    sync_target = st.session_state['sync_selection']
+    matching = [x for x in all_items if x['path'] == sync_target or sync_target.startswith(x['path'])]
+    if matching:
+        st.session_state['current_selection_data'] = matching[0]
+        st.toast(f"Matched: {matching[0]['name']}")
+        st.session_state['sync_selection'] = None
+
+with col1:
+    tab_new, tab_exist = st.tabs(["🆕 Untidy Queue", "📚 Imported"])
+    with tab_new:
+        if not new_items:
+            st.info("Queue Empty.")
         else:
-            # Create DataFrame for display
-            df_q = pd.DataFrame(queue_items)
-            df_q['Status'] = "⚪ New"
+            df_new = pd.DataFrame(new_items)
+            sel_new = st.dataframe(
+                df_new[['name']],
+                column_config={"name": st.column_config.TextColumn("Book Name")},
+                use_container_width=True, hide_index=True, height=600,
+                on_select="rerun", selection_mode="single-row", key="grid_new"
+            )
+            if sel_new.selection.rows:
+                st.session_state['current_selection_data'] = new_items[sel_new.selection.rows[0]]
+
+    with tab_exist:
+        if not existing_items:
+            st.info("Empty.")
+        else:
+            df_exist = pd.DataFrame(existing_items)
+            sel_exist = st.dataframe(
+                df_exist[['State', 'name']],
+                column_config={"State": st.column_config.TextColumn("St", width="small")},
+                use_container_width=True, hide_index=True, height=600,
+                on_select="rerun", selection_mode="single-row", key="grid_exist"
+            )
+            if sel_exist.selection.rows:
+                st.session_state['current_selection_data'] = existing_items[sel_exist.selection.rows[0]]
+
+# Sync: Queue -> Explorer
+selected_item = st.session_state.get('current_selection_data')
+if selected_item:
+    if selected_item['path'] != st.session_state.get('last_jumped_path'):
+        st.session_state['exp_path'] = os.path.dirname(selected_item['path']) if os.path.isfile(selected_item['path']) else selected_item['path']
+        st.session_state['last_jumped_path'] = selected_item['path']
+        st.rerun()
+
+# ==================== COLUMN 2: EDITOR ====================
+with col2:
+    if selected_item:
+        st.subheader("✏️ Editor")
+        st.caption(f"Path: `{selected_item['path']}`")
+        if st.button("❌ Close Editor"):
+            st.session_state['current_selection_data'] = None
+            st.rerun()
             
-            sel_q = st.dataframe(
-                df_q[['Status', 'name']],
-                column_config={"name": st.column_config.TextColumn("Folder Name")},
-                use_container_width=True,
-                hide_index=True,
-                on_select="rerun",
-                selection_mode="single-row",
-                height=600
+        c_src, c_bar, c_btn = st.columns([1, 2, 1])
+        with c_src: provider = st.selectbox("Source", ["Apple Books", "Google Books"], key='search_provider', label_visibility="collapsed")
+        with c_bar: 
+            clean_q = clean_search_query(selected_item['name'])
+            q = st.text_input("Search", value=clean_q, label_visibility="collapsed")
+        with c_btn: do_search = st.button("Search")
+
+        def update_form_state():
+            if 'result_selector' in st.session_state and 'search_results' in st.session_state:
+                opts = {f"{b.get('authors')} - {b.get('title')}": b for b in st.session_state['search_results']}
+                sel_key = st.session_state['result_selector']
+                if sel_key in opts:
+                    data = opts[sel_key]
+                    st.session_state['form_auth'] = data.get('authors', '')
+                    st.session_state['form_title'] = data.get('title', '')
+                    st.session_state['form_narr'] = data.get('narrators', '')
+                    st.session_state['form_series'] = data.get('series', '')
+                    st.session_state['form_part'] = data.get('part', '')
+                    rd = data.get('releaseDate')
+                    st.session_state['form_year'] = rd[:4] if rd else ''
+                    st.session_state['form_desc'] = data.get('summary', '')
+                    st.session_state['form_img'] = data.get('image', '')
+
+        if do_search:
+            with st.spinner(f"Searching {provider}..."):
+                res = fetch_metadata(q, provider)
+                if res:
+                    st.session_state['search_results'] = res
+                    first = f"{res[0].get('authors')} - {res[0].get('title')}"
+                    st.session_state['result_selector'] = first
+                    update_form_state()
+                else: st.warning(f"No matches.")
+
+        if 'search_results' in st.session_state:
+            opts = [f"{b.get('authors')} - {b.get('title')}" for b in st.session_state['search_results']]
+            if opts: st.selectbox("Results", opts, key='result_selector', on_change=update_form_state)
+
+        with st.form("main"):
+            c1, c2 = st.columns(2)
+            auth = c1.text_input("Author", key='form_auth')
+            titl = c1.text_input("Title", key='form_title')
+            narr = c1.text_input("Narrator", key='form_narr')
+            seri = c2.text_input("Series", key='form_series')
+            part = c2.text_input("Part #", key='form_part')
+            year = c2.text_input("Year", key='form_year')
+            desc = st.text_area("Desc", key='form_desc')
+            img = st.text_input("Cover URL", key='form_img')
+            if img: st.image(img, width=100)
+            
+            lbl = "Make Tidy & Import"
+            if selected_item['status_code'] == 1: lbl = "Fix Structure (Move)"
+            if st.form_submit_button(lbl, type="primary"):
+                if auth and titl:
+                    process_selection(selected_item, auth, titl, seri, part, desc, img, narr, year)
+                else: st.error("Author/Title Required")
+    else:
+        st.info("👈 Select a book to edit.")
+
+# ==================== COLUMN 3: EXPLORER & BUILDER ====================
+with col3:
+    st.subheader("📂 Explorer & Builder")
+    curr_path = st.session_state['exp_path']
+    
+    # Breadcrumb / Up
+    col_u, col_p = st.columns([0.2, 0.8])
+    with col_u:
+        if st.button("⬆️"):
+            st.session_state['exp_path'] = os.path.dirname(curr_path)
+            st.rerun()
+    with col_p:
+        st.caption(f".../{os.path.basename(curr_path)}/")
+
+    try:
+        items = sorted(os.listdir(curr_path))
+        file_list = []
+        for i in items:
+            full = os.path.join(curr_path, i)
+            is_dir = os.path.isdir(full)
+            if is_dir or i.lower().endswith(('.mp3','.m4b','.m4a','.flac')):
+                file_list.append({"icon": "📁" if is_dir else "🎵", "name": i, "path": full, "type": "dir" if is_dir else "file"})
+        
+        if file_list:
+            df_files = pd.DataFrame(file_list)
+            
+            # --- MULTI SELECT TABLE ---
+            sel_files = st.dataframe(
+                df_files[['icon', 'name']],
+                column_config={"icon": st.column_config.TextColumn("", width="small")},
+                hide_index=True, use_container_width=True, height=450,
+                on_select="rerun", selection_mode="multi-row"
             )
             
-            selected_queue = None
-            if sel_q.selection.rows:
-                idx = sel_q.selection.rows[0]
-                selected_queue = queue_items[idx]
-
-    # --- TAB 2: MANUAL EXPLORER ---
-    with tab_ex:
-        curr_path = st.session_state['exp_path']
-        
-        # Breadcrumbs / Nav
-        c_up, c_path = st.columns([0.2, 0.8])
-        with c_up:
-            if st.button("⬆️", help="Go Up"):
-                st.session_state['exp_path'] = os.path.dirname(curr_path)
-                st.rerun()
-        with c_path:
-            st.caption(f".../{os.path.basename(curr_path)}/")
-
-        # Get contents
-        try:
-            items = sorted(os.listdir(curr_path))
-            # Build Dataframe for selection
-            file_data = []
-            for i in items:
-                full = os.path.join(curr_path, i)
-                is_dir = os.path.isdir(full)
-                # Filter: Show Dirs and Audio Files only
-                if is_dir or i.lower().endswith(('.mp3','.m4b','.m4a','.flac')):
-                    file_data.append({
-                        "icon": "📁" if is_dir else "🎵",
-                        "name": i,
-                        "path": full,
-                        "type": "folder" if is_dir else "file"
-                    })
+            # Handle Selections
+            selected_rows = sel_files.selection.rows
             
-            if file_data:
-                df_ex = pd.DataFrame(file_data)
+            if selected_rows:
+                # Get the actual items
+                selection_data = [file_list[i] for i in selected_rows]
+                st.markdown("---")
+                st.caption(f"Selected: {len(selection_data)} items")
                 
-                # SELECTION TABLE
-                sel_ex = st.dataframe(
-                    df_ex[['icon', 'name']],
-                    column_config={
-                        "icon": st.column_config.TextColumn("", width="small"),
-                        "name": st.column_config.TextColumn("Name"),
-                    },
-                    use_container_width=True,
-                    hide_index=True,
-                    on_select="rerun",
-                    selection_mode="multi-row", # ENABLE MULTI-SELECT
-                    height=550
-                )
-                
-                selected_files_rows = sel_ex.selection.rows
-                selected_explorer_items = [file_data[i] for i in selected_files_rows]
-            else:
-                st.info("Empty folder.")
-                selected_explorer_items = []
-
-        except Exception as e:
-            st.error(f"Error: {e}")
-            selected_explorer_items = []
-
-# ==========================================
-# 2. MIDDLE COLUMN: THE BUILDER
-# ==========================================
-with col_edit:
-    st.subheader("🛠️ Book Builder")
-    
-    # --- DETERMINE ACTIVE SELECTION ---
-    # Logic: If user selected something in Explorer, that takes priority.
-    # Otherwise, use the Queue selection.
-    
-    active_files = []
-    active_name = ""
-    
-    if selected_explorer_items:
-        # EXPLORER MODE
-        st.info(f"Selected {len(selected_explorer_items)} items from Explorer")
-        
-        # Check if user selected exactly ONE folder -> Offer to "Open" it
-        if len(selected_explorer_items) == 1 and selected_explorer_items[0]['type'] == 'folder':
-            target_folder = selected_explorer_items[0]['path']
-            if st.button(f"📂 Open '{selected_explorer_items[0]['name']}'"):
-                st.session_state['exp_path'] = target_folder
-                st.rerun()
-        
-        # Build file list
-        for item in selected_explorer_items:
-            if item['type'] == 'folder':
-                # Add all audio in folder
-                for root, _, fs in os.walk(item['path']):
-                    for f in fs:
-                        if f.lower().endswith(('.mp3','.m4b','.m4a','.flac')):
-                            active_files.append(os.path.join(root, f))
-            else:
-                active_files.append(item['path'])
-        
-        # Guess name from first item
-        if active_files:
-            active_name = os.path.splitext(os.path.basename(active_files[0]))[0]
+                # Logic 1: Navigation (Single Folder)
+                if len(selection_data) == 1 and selection_data[0]['type'] == 'dir':
+                    if st.button(f"📂 Open '{selection_data[0]['name']}'"):
+                        st.session_state['exp_path'] = selection_data[0]['path']
+                        # Trigger sync to Queue if it matches a book
+                        st.session_state['sync_selection'] = selection_data[0]['path']
+                        st.rerun()
+                        
+                # Logic 2: Manual Bundle
+                with st.form("manual_bundle"):
+                    new_name = st.text_input("New Book Title", value=selection_data[0]['name'])
+                    if st.form_submit_button("✨ Bundle as Book"):
+                        # Collect all files (recurse if folder selected)
+                        final_paths = []
+                        for item in selection_data:
+                            if item['type'] == 'dir':
+                                for root, _, fs in os.walk(item['path']):
+                                    for f in fs:
+                                        if f.lower().endswith(('.mp3','.m4b','.m4a','.flac')):
+                                            final_paths.append(os.path.join(root, f))
+                            else:
+                                final_paths.append(item['path'])
+                        
+                        if final_paths:
+                            entry = {
+                                "id": f"MANUAL|{time.time()}", "path": curr_path,
+                                "name": new_name, "clean": sanitize_for_matching(new_name),
+                                "file_list": final_paths, "is_group": True, "is_manual": True
+                            }
+                            st.session_state['manual_books'].insert(0, entry)
+                            st.success("Added to Queue!")
+                            time.sleep(0.5)
+                            st.rerun()
+                        else:
+                            st.error("No audio files found in selection.")
             
-    elif selected_queue:
-        # QUEUE MODE
-        st.info(f"Editing: {selected_queue['name']}")
-        active_files = selected_queue['file_list']
-        active_name = selected_queue['name']
-    
-    else:
-        st.warning("👈 Select a book from the Queue or highlight files in Explorer.")
-        st.stop()
-
-    # --- EDITOR FORM ---
-    
-    # 1. Search Bar
-    c_prov, c_search, c_go = st.columns([1, 2, 1])
-    with c_prov:
-        prov = st.selectbox("Source", ["Apple Books", "Google Books"], label_visibility="collapsed")
-    with c_search:
-        clean = clean_search_query(active_name)
-        query = st.text_input("Search Meta", value=clean, label_visibility="collapsed")
-    with c_go:
-        search_trigger = st.button("🔍 Search")
-
-    # 2. Results Handler
-    if search_trigger:
-        with st.spinner("Searching..."):
-            results = fetch_metadata(query, prov)
-            if results:
-                st.session_state['search_res'] = results
-                st.session_state['fill_idx'] = 0 # Default to first
-            else:
-                st.error("No matches.")
-
-    # 3. Fill Form from Results
-    meta_fill = {}
-    if 'search_res' in st.session_state:
-        res_list = st.session_state['search_res']
-        res_names = [f"{r['authors']} - {r['title']}" for r in res_list]
-        
-        selected_fill = st.selectbox("Select Match:", res_names)
-        # Find index
-        idx = res_names.index(selected_fill)
-        meta_fill = res_list[idx]
-
-    # 4. THE FORM
-    with st.form("book_editor"):
-        c1, c2 = st.columns(2)
-        f_auth = c1.text_input("Author", value=meta_fill.get('authors', ''))
-        f_title = c1.text_input("Title", value=meta_fill.get('title', active_name))
-        f_narr = c1.text_input("Narrator", value=meta_fill.get('narrators', ''))
-        f_series = c2.text_input("Series", value=meta_fill.get('series', ''))
-        f_part = c2.text_input("Part #", value=meta_fill.get('part', ''))
-        f_year = c2.text_input("Year", value=meta_fill.get('year', ''))
-        f_desc = st.text_area("Description", value=meta_fill.get('desc', ''))
-        f_img = st.text_input("Cover URL", value=meta_fill.get('img', ''))
-        
-        if f_img: st.image(f_img, width=120)
-        
-        st.write(f"**Files to Process:** {len(active_files)}")
-        
-        if st.form_submit_button("🚀 Import Book", type="primary"):
-            if not f_title or not f_auth:
-                st.error("Title and Author are required.")
-            else:
-                # Bundle Metadata
-                final_meta = {
-                    "title": f_title, "authors": f_auth, "narrators": f_narr,
-                    "series": f_series, "part": f_part, "year": f_year,
-                    "desc": f_desc, "img": f_img
-                }
-                
-                # PROCESS
-                done_name = process_book(active_files, final_meta)
-                
-                # Feedback & Refresh
-                st.success(f"Successfully Imported: {done_name}")
-                st.session_state['last_processed'] = done_name
-                
-                # Force Cache Clear to update Queue and Library
-                st.cache_data.clear()
-                time.sleep(1.5)
-                st.rerun()
-
-# ==========================================
-# 3. RIGHT COLUMN: LIBRARY STATUS
-# ==========================================
-with col_lib:
-    st.subheader("📚 Library")
-    
-    # Force Rescan Button
-    if st.button("🔄 Rescan All"):
-        st.cache_data.clear()
-        scan_library_now()
-        st.rerun()
-        
-    # Get Current Library
-    lib_items = load_json(CACHE_FILE, [])
-    if not lib_items:
-        # First run check
-        lib_items = scan_library_now()
-    
-    if lib_items:
-        df_lib = pd.DataFrame(lib_items)
-        st.dataframe(
-            df_lib[['name']], 
-            column_config={"name": st.column_config.TextColumn("Imported Books")},
-            hide_index=True,
-            use_container_width=True,
-            height=600
-        )
-    else:
-        st.caption("Library is empty.")
+    except Exception as e: st.error(f"Error: {e}")
