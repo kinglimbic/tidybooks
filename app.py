@@ -52,10 +52,12 @@ def save_json(filepath, data):
 def sanitize_for_matching(text):
     if not text: return ""
     text = text.lower()
+    # Remove common filler words
     text = re.sub(r'\b(audiobook|mp3|m4b|cd|disc|part|v|vol|chapter)\b', '', text)
-    text = re.sub(r'[^a-z]', '', text) 
+    # KEEP a-z AND 0-9. Remove everything else.
+    text = re.sub(r'[^a-z0-9]', '', text) 
     return text
-
+    
 def sanitize_filename(name):
     if not name: return "Unknown"
     clean = name.replace("/", "-").replace("\\", "-")
@@ -158,14 +160,20 @@ def scan_downloads_snapshot():
     return candidates
 
 def get_candidates_with_status():
+    # 1. Get Auto-Scanned Items (Cached)
     raw_candidates = scan_downloads_snapshot()
+    
+    # 2. Get Manually Created Items (from Session State)
     manual_items = st.session_state.get('manual_books', [])
     all_candidates = manual_items + raw_candidates
     
     history = load_json(HISTORY_FILE, [])
     
+    # LOAD LIBRARY CACHE ONCE (Critical for speed)
+    # If cache is empty, we scan once.
     cached_lib = load_json(CACHE_FILE, [])
-    if not cached_lib: cached_lib = scan_library_now()
+    if not cached_lib: 
+        cached_lib = scan_library_now()
     library_items = cached_lib
     
     final_list = []
@@ -173,20 +181,26 @@ def get_candidates_with_status():
     for data in all_candidates:
         unique_id = data['id']
         path_str = data['path']
-        clean_dl = data['clean']
+        # Recalculate clean name here to be safe
+        clean_dl = sanitize_for_matching(data['name'])
+        
         status = 0 
         match_path = None
         
-        # Status 3: History (Already Done)
+        # Check History
         if unique_id in history or path_str in history:
             status = 3
-        # Status 1: Match Found in Library (Needs Fix/Merge)
+        
+        # Check Library Match
         elif library_items:
             for lib_item in library_items:
                 clean_lib = lib_item.get('clean')
                 if not clean_lib: continue
-                # Basic fuzzy match: if clean name is contained in the other
-                if len(clean_lib) > 4 and (clean_lib in clean_dl or clean_dl in clean_lib):
+                
+                # MATCH LOGIC FIX:
+                # 1. Allow numbers (handled by new sanitize function)
+                # 2. Lower threshold to 2 chars (for short titles like "It" or "1984")
+                if len(clean_lib) > 2 and (clean_lib in clean_dl or clean_dl in clean_lib):
                     match_path = lib_item['path']
                     status = 1
                     break
@@ -199,15 +213,19 @@ def get_candidates_with_status():
         if data.get('is_manual'): display_name = f"🛠️ {display_name}"
         
         final_list.append({
-            "path": data['path'], "unique_id": unique_id,
-            "name": display_name, "raw_name": data['name'],
-            "status_code": status, "State": status_icon, 
-            "match_path": match_path, "file_list": data['file_list'],
+            "path": data['path'], 
+            "unique_id": unique_id,
+            "name": display_name, 
+            "raw_name": data['name'],
+            "status_code": status, 
+            "State": status_icon, 
+            "match_path": match_path, 
+            "file_list": data['file_list'],
             "is_manual": data.get('is_manual', False)
         })
 
     return sorted(final_list, key=lambda x: (x['status_code'] > 0, natural_keys(x['raw_name'])))
-
+    
 # --- SEARCH ---
 def fetch_metadata(query, provider):
     results = []
