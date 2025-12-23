@@ -18,7 +18,7 @@ HISTORY_FILE = os.path.join(DATA_DIR, "processed_log.json")
 CACHE_FILE = os.path.join(DATA_DIR, "library_map_cache.json")
 
 # API ENDPOINTS
-AUDNEXUS_API = "https://api.audnexus.com/books"
+AUDNEXUS_API = "https://api.audnex.us/books" # Corrected URL
 ITUNES_API = "https://itunes.apple.com/search"
 GOOGLE_BOOKS_API = "https://www.googleapis.com/books/v1/volumes"
 
@@ -206,7 +206,6 @@ def calculate_matches(all_candidates, library_items, history):
 def get_candidates_with_status():
     raw_candidates = scan_downloads_snapshot()
     manual_items = st.session_state.get('manual_books', [])
-    # Process both lists independently so we can separate them in tabs
     
     history = load_json(HISTORY_FILE, [])
     cached_lib = load_json(CACHE_FILE, [])
@@ -242,7 +241,7 @@ def extract_details_smart(title, desc, subtitle=""):
     return narrator, series, part
 
 def fetch_audnexus(query):
-    # Added Real Browser Headers to bypass potential blocks
+    # Added Browser Headers to fix connectivity
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
     }
@@ -275,11 +274,13 @@ def fetch_itunes(query):
             results = []
             for item in r.json().get('results', []):
                 img = item.get('artworkUrl100', '').replace('100x100', '600x600')
-                s_narr, s_ser, s_part = extract_details_smart(item.get('collectionName', ''), item.get('description', ''))
+                raw_title = item.get('collectionName', '')
+                raw_desc = item.get('description', '')
+                s_narr, s_ser, s_part = extract_details_smart(raw_title, raw_desc)
                 results.append({
-                    "title": item.get('collectionName'), "authors": item.get('artistName'),
+                    "title": raw_title, "authors": item.get('artistName'),
                     "narrators": s_narr, "series": s_ser, "part": s_part, 
-                    "summary": item.get('description', ''), "image": img, "releaseDate": item.get('releaseDate', '')
+                    "summary": raw_desc, "image": img, "releaseDate": item.get('releaseDate', '')
                 })
             return results
     except: pass
@@ -339,6 +340,7 @@ def tag_file(file_path, author, title, series, desc, cover_url, year, track_num,
 
 def process_selection(source_data, author, title, series, series_part, desc, cover_url, narrator, publish_year, target_override=None):
     files_to_process = source_data['file_list']
+    
     if target_override:
         dest_base = target_override
         try:
@@ -357,6 +359,7 @@ def process_selection(source_data, author, title, series, series_part, desc, cov
     files_to_process.sort()
     total = len(files_to_process)
     pad = max(2, len(str(total)))
+    
     bar = st.progress(0)
     for i, src in enumerate(files_to_process):
         ext = os.path.splitext(src)[1]
@@ -394,32 +397,42 @@ def process_selection(source_data, author, title, series, series_part, desc, cov
 # --- MAIN LAYOUT ---
 col1, col2, col3 = st.columns([1.5, 2, 1.5])
 
-# Fetch Separate Lists
+# Fetch Data
 auto_processed, manual_processed = get_candidates_with_status()
 
-# AUTO LISTS
+# Auto Lists
 new_items = [x for x in auto_processed if x['status_code'] == 0]
 match_items = [x for x in auto_processed if x['status_code'] == 1]
 existing_items = [x for x in auto_processed if x['status_code'] == 3]
 
-# MANUAL LISTS
+# Manual List
 built_items = [x for x in manual_processed]
 
-# Sync Explorer -> Queue
+# Sync: Explorer -> Queue
 if st.session_state['sync_selection']:
     sync_target = st.session_state['sync_selection']
     all_known = auto_processed + manual_processed
     matching = [x for x in all_known if x['path'] == sync_target or sync_target.startswith(x['path'])]
     if matching:
         st.session_state['current_selection_data'] = matching[0]
+        # Auto-Switch Logic: If manual, bump manual key. If auto, bump auto key.
+        if matching[0] in manual_processed:
+            st.session_state['grid_key_auto'] += 1
+            st.session_state['grid_key_match'] += 1
+            st.session_state['grid_key_done'] += 1
+        else:
+            st.session_state['grid_key_manual'] += 1
+            st.session_state['grid_key_match'] += 1
+            st.session_state['grid_key_done'] += 1
+            
         st.toast(f"Matched: {matching[0]['name']}")
         st.session_state['sync_selection'] = None
 
-# --- COLUMN 1: TABS ---
+# --- COL 1: QUEUE ---
 with col1:
     tab_new, tab_built, tab_match, tab_exist = st.tabs(["🆕 Untidy", "🛠️ Built", "⚠️ Match", "📚 Done"])
     
-    # Auto-Deselect Helper: Clears other keys when one is selected
+    # Grid Deselection Logic
     def on_grid_select(grid_name):
         if grid_name == 'untidy': 
             st.session_state['grid_key_manual'] += 1
@@ -439,11 +452,11 @@ with col1:
             st.session_state['grid_key_match'] += 1
 
     with tab_new:
-        if not new_items: st.info("Empty.")
+        if not new_items: st.info("Empty")
         else:
-            df_new = pd.DataFrame(new_items)
+            df = pd.DataFrame(new_items)
             sel = st.dataframe(
-                df_new[['name']], column_config={"name": "Folder Name"},
+                df[['name']], column_config={"name": "Folder Name"},
                 use_container_width=True, hide_index=True, height=600,
                 on_select=lambda: on_grid_select('untidy'), selection_mode="single-row",
                 key=f"grid_auto_{st.session_state['grid_key_auto']}"
@@ -453,9 +466,9 @@ with col1:
     with tab_built:
         if not built_items: st.info("Use Explorer to bundle files.")
         else:
-            df_built = pd.DataFrame(built_items)
+            df = pd.DataFrame(built_items)
             sel = st.dataframe(
-                df_built[['name']], column_config={"name": "Bundle Name"},
+                df[['name']], column_config={"name": "Bundle Name"},
                 use_container_width=True, hide_index=True, height=600,
                 on_select=lambda: on_grid_select('built'), selection_mode="single-row",
                 key=f"grid_manual_{st.session_state['grid_key_manual']}"
@@ -465,9 +478,9 @@ with col1:
     with tab_match:
         if not match_items: st.info("No duplicates.")
         else:
-            df_match = pd.DataFrame(match_items)
+            df = pd.DataFrame(match_items)
             sel = st.dataframe(
-                df_match[['name']], column_config={"name": "Matches"},
+                df[['name']], column_config={"name": "Matches"},
                 use_container_width=True, hide_index=True, height=600,
                 on_select=lambda: on_grid_select('match'), selection_mode="single-row",
                 key=f"grid_match_{st.session_state['grid_key_match']}"
@@ -477,9 +490,9 @@ with col1:
     with tab_exist:
         if not existing_items: st.info("Empty.")
         else:
-            df_exist = pd.DataFrame(existing_items)
+            df = pd.DataFrame(existing_items)
             sel = st.dataframe(
-                df_exist[['name']], column_config={"name": "History"},
+                df[['name']], column_config={"name": "History"},
                 use_container_width=True, hide_index=True, height=600,
                 on_select=lambda: on_grid_select('done'), selection_mode="single-row",
                 key=f"grid_done_{st.session_state['grid_key_done']}"
@@ -496,7 +509,7 @@ if selected_item:
         st.session_state['last_synced_book_id'] = selected_item['unique_id']
         st.rerun()
 
-# ==================== COLUMN 2: EDITOR ====================
+# --- COL 2: EDITOR ---
 with col2:
     if selected_item:
         st.subheader("✏️ Editor")
@@ -572,7 +585,7 @@ with col2:
     else:
         st.info("👈 Select a book.")
 
-# ==================== COLUMN 3: EXPLORER ====================
+# --- COL 3: EXPLORER ---
 with col3:
     st.subheader("📂 Explorer & Builder")
     curr_path = st.session_state['exp_path']
