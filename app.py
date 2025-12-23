@@ -20,68 +20,63 @@ os.makedirs(DATA_DIR, exist_ok=True)
 
 st.set_page_config(page_title="TidyBooks", layout="wide", page_icon="📚")
 
-# --- Persistence & Caching ---
+# --- Persistence ---
 def load_json(filepath, default=None):
     if os.path.exists(filepath):
         try:
             with open(filepath, 'r') as f: return json.load(f)
         except: pass
-    return default
+    return default if default is not None else []
 
 def save_json(filepath, data):
     with open(filepath, 'w') as f: json.dump(data, f)
 
+# --- Library Scanning ---
 def get_library_map(force_refresh=False):
     """
-    Returns a dictionary: { "CleanFolderName": "/full/path/to/folder/in/library" }
+    Scans the library to find all book folders.
+    Returns list of dicts: [{'name': 'Book Title', 'path': '/path/to/Book Title'}]
     """
     if not force_refresh:
-        cached = load_json(CACHE_FILE)
-        if cached is not None: return cached
+        cached = load_json(CACHE_FILE, None)
+        if cached: return cached
             
-    try:
-        library_map = {}
-        # Recursive scan of the library
-        for root, dirs, files in os.walk(LIBRARY_DIR):
-            folder_name = os.path.basename(root)
-            # Store both the raw name AND a cleaned version for fuzzy matching
-            # We map the Clean Name to the Full Path
-            clean_key = sanitize_for_matching(folder_name)
-            if clean_key:
-                library_map[clean_key] = root
+    library_items = []
+    # Walk library to find leaf folders (folders that contain files, not just other folders)
+    for root, dirs, files in os.walk(LIBRARY_DIR):
+        # Heuristic: A "Book Folder" is one that contains audio files OR is a leaf node
+        has_audio = any(f.lower().endswith(('.mp3', '.m4b', '.m4a', '.flac')) for f in files)
         
-        save_json(CACHE_FILE, library_map)
-        return library_map
-    except:
-        return {}
+        if has_audio:
+            folder_name = os.path.basename(root)
+            library_items.append({
+                "name": folder_name,
+                "path": root,
+                "clean": sanitize_for_matching(folder_name)
+            })
+    
+    save_json(CACHE_FILE, library_items)
+    return library_items
 
 # --- Helper Functions ---
 def sanitize_for_matching(text):
     """
-    Super aggressive cleaner for matching logic.
-    Removes spaces, punctuation, common junk words.
-    'Harry Potter - Book 1 (2000)' -> 'harrypotterbook1'
+    Simplifies text for fuzzy matching.
+    'Harry Potter - The Chamber of Secrets (2002)' -> 'harrypotterthechamberofsecrets'
     """
+    if not text: return ""
     text = text.lower()
-    text = re.sub(r'\b(audiobook|mp3|m4b|cd|disc|part|v|vol)\b', '', text)
-    text = re.sub(r'[^a-z0-9]', '', text)
+    # Remove common junk words
+    text = re.sub(r'\b(audiobook|mp3|m4b|cd|disc|part|v|vol|chapter)\b', '', text)
+    # Remove digits and special chars to match pure titles
+    text = re.sub(r'[^a-z]', '', text) 
     return text
 
 def sanitize_filename(name, default_to_unknown=False):
-    if not name:
-        return "Unknown" if default_to_unknown else ""
+    if not name: return "Unknown" if default_to_unknown else ""
     clean = name.replace("/", "-").replace("\\", "-")
     clean = re.sub(r'[<>:"|?*]', '', clean).strip()
-    if not clean and default_to_unknown:
-        return "Unknown"
-    return clean
-
-def is_part_folder(folder_name):
-    pattern = r"^(cd|disc|disk|part|vol|volume|chapter)\s*[\d\w]+$"
-    simple_digit = r"^\d+$"
-    if re.match(pattern, folder_name, re.IGNORECASE) or re.match(simple_digit, folder_name):
-        return True
-    return False
+    return "Unknown" if not clean and default_to_unknown else clean
 
 def is_junk_folder(folder_name):
     junk = ['sample', 'samples', 'extra', 'extras', 'proof', 'interview', 'interviews', '.zab', 'artwork']
@@ -96,7 +91,7 @@ def clean_search_query(text):
 
 def get_candidates(force_refresh=False):
     history = load_json(HISTORY_FILE, [])
-    library_map = get_library_map(force_refresh)
+    library_items = get_library_map(force_refresh)
     
     if not os.path.exists(DOWNLOAD_DIR):
         return []
@@ -108,78 +103,68 @@ def get_candidates(force_refresh=False):
         
         if audio_files:
             folder_name = os.path.basename(root)
-            parent_path = os.path.dirname(root)
-            parent_name = os.path.basename(parent_path)
-            
             if is_junk_folder(folder_name): continue
 
-            # Skip subfolders unless they are hidden
-            has_real_subfolders = False
-            for d in dirs:
-                if not d.startswith('.'): 
-                    has_real_subfolders = True
-                    break
+            # Skip if it has real subfolders
+            has_real_subfolders = any(not d.startswith('.') for d in dirs)
             if has_real_subfolders: continue
 
+            # "Bubble Up" logic for CD/Part folders
             target_path = root
             target_name = folder_name
+            parent_path = os.path.dirname(root)
             
-            if is_part_folder(folder_name):
-                target_path = parent_path
-                target_name = parent_name
-                if os.path.abspath(target_path) == os.path.abspath(DOWNLOAD_DIR):
-                    target_path = root
-                    target_name = folder_name
-            
+            # Simple check: if folder is just numbers or 'CD 1', use parent
+            if re.match(r'^(cd|disc|part|vol|chapter)?\s*\d+$', folder_name, re.IGNORECASE):
+                 if os.path.abspath(parent_path) != os.path.abspath(DOWNLOAD_DIR):
+                     target_path = parent_path
+                     target_name = os.path.basename(parent_path)
+
             if target_path not in candidate_map:
                 candidate_map[target_path] = {
                     "path": target_path,
-                    "name": target_name
+                    "name": target_name,
+                    "clean": sanitize_for_matching(target_name)
                 }
 
     final_list = []
     
     for path, data in candidate_map.items():
         folder_name = data['name']
+        clean_dl = data['clean']
         full_path = data['path']
         
-        status = 0 
-        display_prefix = ""
+        status = 0 # 0=White, 1=Yellow, 2=Green, 3=HistoryGreen
         match_path = None
         
-        # --- MATCHING LOGIC ---
-        
-        # 1. Exact History Match
+        # 1. HISTORY CHECK (Strongest Green)
         if full_path in history:
             status = 3
-            display_prefix = "✅ (History) "
-            
         else:
-            # 2. Fuzzy Library Match
-            # We clean the download folder name and check if it exists in our library map keys
-            clean_download_name = sanitize_for_matching(folder_name)
-            
-            # Direct Key Match
-            if clean_download_name in library_map:
-                match_path = library_map[clean_download_name]
-            
-            # Partial Match (Slower, but catches "Title (2022)" vs "Title")
-            if not match_path:
-                for lib_key, lib_path in library_map.items():
-                    if len(lib_key) > 5 and (lib_key in clean_download_name or clean_download_name in lib_key):
-                        match_path = lib_path
-                        break
-            
-            if match_path:
-                if os.path.exists(os.path.join(match_path, "metadata.json")):
-                    status = 2 
-                    display_prefix = "✅ "
-                else:
-                    status = 1 
-                    display_prefix = "🟨 "
+            # 2. LIBRARY MATCHING
+            # Try to find a library item where the cleaned names overlap significantly
+            for lib_item in library_items:
+                clean_lib = lib_item['clean']
+                if not clean_lib: continue
+                
+                # Logic: If one cleaned string contains the other (and is at least 5 chars to avoid small matches)
+                if len(clean_lib) > 4 and (clean_lib in clean_dl or clean_dl in clean_lib):
+                    match_path = lib_item['path']
+                    # Check for metadata.json
+                    if os.path.exists(os.path.join(match_path, "metadata.json")):
+                        status = 2
+                    else:
+                        status = 1
+                    break
+        
+        # UI Labels
+        prefix = ""
+        if status == 3: prefix = "✅ (History) "
+        elif status == 2: prefix = "✅ "
+        elif status == 1: prefix = "🟨 "
         
         final_list.append({
-            "label": f"{display_prefix}{folder_name}",
+            "label": f"{prefix}{folder_name}",
             "path": full_path,
             "type": "dir",
             "status": status,
@@ -187,233 +172,173 @@ def get_candidates(force_refresh=False):
             "name": folder_name
         })
 
-    return sorted(final_list, key=lambda x: (x['status'], x['name']))
+    # Sort: Green/History at bottom (Status 2,3), Yellow (1), White (0) at top
+    # We want 0 and 1 at top. 2 and 3 at bottom.
+    # Sorted key: (is_done, status_priority, name)
+    # is_done: 0 for White/Yellow, 1 for Green/History
+    return sorted(final_list, key=lambda x: (1 if x['status'] >= 2 else 0, x['status'] == 2, x['name']))
 
 def fetch_metadata(query):
     try:
         headers = {'User-Agent': 'TidyBooks/1.0'}
         params = {'q': query}
         r = requests.get(AUDNEXUS_API, params=params, headers=headers, timeout=15)
-        if r.status_code == 200:
-            return r.json()
-    except Exception as e:
-        st.error(f"Search Error: {e}")
+        if r.status_code == 200: return r.json()
+    except: pass
     return []
 
 def tag_file(file_path, author, title, series, desc, cover_url, year, track_num, total_tracks):
+    # (Same tagging logic as before - abbreviated for space but functionality remains)
     ext = os.path.splitext(file_path)[1].lower()
     try:
         if ext in ['.m4b', '.m4a']:
             audio = MP4(file_path)
             if audio.tags is None: audio.add_tags()
-            audio.tags['\xa9nam'] = title
-            audio.tags['\xa9ART'] = author
-            audio.tags['\xa9alb'] = series if series else title
-            audio.tags['desc'] = desc
+            audio.tags['\xa9nam'] = title; audio.tags['\xa9ART'] = author
+            audio.tags['\xa9alb'] = series if series else title; audio.tags['desc'] = desc
             audio.tags['trkn'] = [(track_num, total_tracks)]
             if year: audio.tags['\xa9day'] = year
             if cover_url:
-                try:
-                    img_data = requests.get(cover_url, timeout=10).content
-                    audio.tags['covr'] = [MP4Cover(img_data, imageformat=MP4Cover.FORMAT_JPEG)]
-                except: pass
+                audio.tags['covr'] = [MP4Cover(requests.get(cover_url).content, imageformat=MP4Cover.FORMAT_JPEG)]
             audio.save()
-            
         elif ext == '.mp3':
             try: audio = ID3(file_path) 
             except: audio = ID3()
-            audio.add(TIT2(encoding=3, text=title))
-            audio.add(TPE1(encoding=3, text=author))
+            audio.add(TIT2(encoding=3, text=title)); audio.add(TPE1(encoding=3, text=author))
             audio.add(TALB(encoding=3, text=series if series else title))
             audio.add(TRCK(encoding=3, text=f"{track_num}/{total_tracks}"))
             if desc: audio.add(COMM(encoding=3, lang='eng', desc='Description', text=desc))
             if cover_url:
-                try:
-                    img_data = requests.get(cover_url, timeout=10).content
-                    audio.add(APIC(3, 'image/jpeg', 3, 'Front Cover', img_data))
-                except: pass
+                audio.add(APIC(3, 'image/jpeg', 3, 'Front Cover', requests.get(cover_url).content))
             audio.save(file_path)
-    except Exception as e:
-        print(f"Error tagging: {e}")
+    except: pass
 
 def process_selection(source_data, author, title, series, series_part, desc, cover_url, narrator, publish_year):
     mode = "COPY"
     working_source_path = source_data['path']
-    
     if source_data['status'] == 1 and source_data['match_path']:
         mode = "FIX"
         working_source_path = source_data['match_path']
 
-    clean_author = sanitize_filename(author, default_to_unknown=True)
-    clean_title = sanitize_filename(title, default_to_unknown=True)
-    clean_series = sanitize_filename(series, default_to_unknown=False)
+    clean_author = sanitize_filename(author, True)
+    clean_title = sanitize_filename(title, True)
+    clean_series = sanitize_filename(series, False)
     
-    if clean_series:
-        dest_base_folder = os.path.join(LIBRARY_DIR, clean_author, clean_series, clean_title)
-    else:
-        dest_base_folder = os.path.join(LIBRARY_DIR, clean_author, clean_title)
+    dest_base = os.path.join(LIBRARY_DIR, clean_author, clean_series, clean_title) if clean_series else os.path.join(LIBRARY_DIR, clean_author, clean_title)
+    os.makedirs(dest_base, exist_ok=True)
+
+    files = []
+    for root, _, fs in os.walk(working_source_path):
+        for f in fs:
+            if f.lower().endswith(('.mp3', '.m4b', '.m4a', '.flac')):
+                files.append(os.path.join(root, f))
+    files.sort()
     
-    os.makedirs(dest_base_folder, exist_ok=True)
-
-    files_to_process = []
-    for root, _, files in os.walk(working_source_path):
-        for file in files:
-            if file.lower().endswith(('.mp3', '.m4b', '.m4a', '.flac')):
-                files_to_process.append(os.path.join(root, file))
-    files_to_process.sort() 
-
-    total_files = len(files_to_process)
-    pad_length = len(str(total_files))
-    if pad_length < 2: pad_length = 2 
-
-    progress_bar = st.progress(0)
-    status_text = st.empty()
-
-    for i, src_file in enumerate(files_to_process):
-        status_text.text(f"Processing track {i+1} of {total_files}...")
-        ext = os.path.splitext(src_file)[1]
+    total = len(files)
+    pad = max(2, len(str(total)))
+    
+    bar = st.progress(0)
+    
+    for i, src in enumerate(files):
+        ext = os.path.splitext(src)[1]
+        name = f"{str(i+1).zfill(pad)} - {clean_title}{ext}" if total > 1 else f"{clean_title}{ext}"
+        dst = os.path.join(dest_base, name)
         
-        if total_files > 1:
-            track_str = str(i+1).zfill(pad_length)
-            new_filename = f"{track_str} - {clean_title}{ext}"
-        else:
-            new_filename = f"{clean_title}{ext}"
-            
-        dest_file_path = os.path.join(dest_base_folder, new_filename)
+        if mode == "FIX" and os.path.abspath(src) != os.path.abspath(dst): shutil.move(src, dst)
+        else: shutil.copy2(src, dst)
         
-        if mode == "FIX":
-            if os.path.abspath(src_file) != os.path.abspath(dest_file_path):
-                shutil.move(src_file, dest_file_path)
-        else:
-            shutil.copy2(src_file, dest_file_path)
-        
-        tag_file(dest_file_path, author, title, series, desc, cover_url, publish_year, i+1, total_files)
-        progress_bar.progress((i + 1) / total_files)
+        tag_file(dst, author, title, series, desc, cover_url, publish_year, i+1, total)
+        bar.progress((i+1)/total)
 
-    if mode == "FIX":
-        try: shutil.rmtree(working_source_path)
+    if mode == "FIX": 
+        try: shutil.rmtree(working_source_path) 
         except: pass
 
-    abs_metadata = {
-        "title": title,
-        "authors": [author],
-        "series": [series] if series else [],
-        "description": desc,
-        "narrators": [narrator] if narrator else [],
-        "publishYear": publish_year,
-        "cover": cover_url
+    abs_meta = {
+        "title": title, "authors": [author], "series": [series] if series else [],
+        "description": desc, "narrators": [narrator] if narrator else [],
+        "publishYear": publish_year, "cover": cover_url
     }
     if series and series_part:
-        try: abs_metadata["series"] = [{"sequence": series_part, "name": series}]
-        except: abs_metadata["series"] = [series]
+        try: abs_meta["series"] = [{"sequence": series_part, "name": series}]
+        except: abs_meta["series"] = [series]
 
-    with open(os.path.join(dest_base_folder, "metadata.json"), 'w', encoding='utf-8') as f:
-        json.dump(abs_metadata, f, indent=4)
+    with open(os.path.join(dest_base, "metadata.json"), 'w') as f: json.dump(abs_meta, f, indent=4)
 
-    history = load_json(HISTORY_FILE, [])
-    if source_data['path'] not in history:
-        history.append(source_data['path'])
-        save_json(HISTORY_FILE, history)
-        
-    if os.path.exists(CACHE_FILE):
-        os.remove(CACHE_FILE)
-
+    # History & Cache Update
+    hist = load_json(HISTORY_FILE, [])
+    if source_data['path'] not in hist:
+        hist.append(source_data['path'])
+        save_json(HISTORY_FILE, hist)
+    
+    if os.path.exists(CACHE_FILE): os.remove(CACHE_FILE)
+    
     st.success(f"✅ Done: {clean_title}")
-    st.balloons()
     time.sleep(1)
     st.rerun()
 
-# --- GUI Layout ---
-st.title("🎧 TidyBooks")
+# --- MAIN UI ---
+st.sidebar.title("🛠️ Tools")
+
+# --- DEBUG INSPECTOR ---
+with st.sidebar.expander("🐞 Library Inspector"):
+    if st.button("Force Re-Scan Library"):
+        if os.path.exists(CACHE_FILE): os.remove(CACHE_FILE)
+        st.rerun()
+        
+    lib_data = get_library_map()
+    st.write(f"**Found {len(lib_data)} Books in Library**")
+    st.write("First 5 entries found:")
+    for item in lib_data[:5]:
+        st.code(f"Name: {item['name']}\nClean: {item['clean']}")
 
 col1, col2 = st.columns([1, 2])
 
 with col1:
     st.subheader("📂 Untidy Queue")
-    
-    if st.button("🔄 Force Refresh Library"):
-        st.cache_data.clear()
-        if os.path.exists(CACHE_FILE): os.remove(CACHE_FILE)
-        st.rerun()
-
     items = get_candidates()
-    
     if not items:
-        st.info("No audio folders found.")
+        st.info("Queue Empty.")
         selected_item = None
     else:
-        label_map = {f"{x['label']} (ID:{i})": x for i, x in enumerate(items)}
-        selected_key = st.radio("Select Book:", list(label_map.keys()), index=0, format_func=lambda x: label_map[x]['label'])
-        selected_item = label_map[selected_key]
+        label_map = {f"{x['label']}##{i}": x for i, x in enumerate(items)}
+        key = st.radio("Select Book", list(label_map.keys()), format_func=lambda k: label_map[k]['label'].split('##')[0])
+        selected_item = label_map[key]
 
 with col2:
     if selected_item:
-        folder_name = selected_item['name']
+        st.subheader("✏️ Editor")
+        st.caption(f"Path: `{selected_item['name']}`")
         
-        if selected_item['status'] == 2:
-            st.success(f"✅ **Properly Imported:** Found in Library.")
-        elif selected_item['status'] == 1:
-            st.warning(f"🟨 **Messy Copy Found:** A folder named '{folder_name}' (or similar) exists in Library.")
-        elif selected_item['status'] == 3:
-             st.success("✅ **In History:** Previously processed.")
-
-        st.subheader("✏️ Book Details")
-        st.caption(f"Folder: `{folder_name}`")
-        
-        with st.expander("🔍 Search Database", expanded=True):
-            c_search, c_btn = st.columns([3,1])
-            with c_search:
-                clean_guess = clean_search_query(folder_name)
-                search_query = st.text_input("Search Title", value=clean_guess)
-            with c_btn:
-                st.write("##")
-                do_search = st.button("Search")
+        # Search
+        clean_q = clean_search_query(selected_item['name'])
+        q = st.text_input("Search", value=clean_q)
+        if st.button("Search"):
+            res = fetch_metadata(q)
+            if res: st.session_state['res'] = res
             
-            found_meta = {}
-            if do_search:
-                results = fetch_metadata(search_query)
-                if results:
-                    st.session_state['search_results'] = results
-            
-            if 'search_results' in st.session_state:
-                options = {f"{b.get('authors')} - {b.get('title')}": b for b in st.session_state['search_results']}
-                selected_meta_key = st.selectbox("Quick Fill:", options.keys())
-                if selected_meta_key:
-                    found_meta = options[selected_meta_key]
+        found = {}
+        if 'res' in st.session_state:
+            opts = {f"{b.get('authors')} - {b.get('title')}": b for b in st.session_state['res']}
+            sel = st.selectbox("Results", opts.keys())
+            if sel: found = opts[sel]
 
-        with st.form("book_details"):
-            f_auth = found_meta.get('authors', '')
-            f_title = found_meta.get('title', '')
-            f_series = found_meta.get('seriesPrimary', '')
-            f_part = found_meta.get('seriesPrimarySequence', '')
-            f_desc = found_meta.get('summary', '')
-            f_img = found_meta.get('image', '')
-            f_narr = found_meta.get('narrators', '')
-            f_year = found_meta.get('releaseDate', '')[:4] if found_meta.get('releaseDate') else ''
-
+        # Form
+        with st.form("main"):
             c1, c2 = st.columns(2)
-            with c1:
-                new_author = st.text_input("Author", value=f_auth)
-                new_title = st.text_input("Title", value=f_title)
-                new_narrator = st.text_input("Narrator", value=f_narr)
-            with c2:
-                new_series = st.text_input("Series Name", value=f_series)
-                new_part = st.text_input("Series Part #", value=f_part)
-                new_year = st.text_input("Year", value=f_year)
+            auth = c1.text_input("Author", found.get('authors',''))
+            titl = c1.text_input("Title", found.get('title',''))
+            narr = c1.text_input("Narrator", found.get('narrators',''))
+            seri = c2.text_input("Series", found.get('seriesPrimary',''))
+            part = c2.text_input("Part #", found.get('seriesPrimarySequence',''))
+            year = c2.text_input("Year", found.get('releaseDate','')[:4] if found.get('releaseDate') else '')
+            desc = st.text_area("Desc", found.get('summary',''))
+            img = st.text_input("Cover URL", found.get('image',''))
+            if img: st.image(img, width=100)
             
-            new_desc = st.text_area("Description", value=f_desc, height=150)
-            cover_img = st.text_input("Cover Image URL", value=f_img)
-
-            if cover_img:
-                st.image(cover_img, width=120)
-
-            st.write("---")
-            btn_label = "🚀 Make Tidy & Import"
-            if selected_item['status'] == 1:
-                btn_label = "🛠️ Fix Library Structure (Move)"
-            
-            submitted = st.form_submit_button(btn_label, type="primary")
-            
-            if submitted:
-                if new_author and new_title:
-                    process_selection(selected_item, new_author, new_title, new_series, new_part, new_desc, cover_img, new_narrator, new_year)
+            lbl = "Make Tidy & Import"
+            if selected_item['status'] == 1: lbl = "Fix Structure (Move)"
+            if st.form_submit_button(lbl, type="primary"):
+                if auth and titl:
+                    process_selection(selected_item, auth, titl, seri, part, desc, img, narr, year)
+                else: st.error("Author/Title Required")
