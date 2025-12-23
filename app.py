@@ -33,9 +33,9 @@ if 'exp_path' not in st.session_state: st.session_state['exp_path'] = DOWNLOAD_D
 if 'sync_selection' not in st.session_state: st.session_state['sync_selection'] = None
 if 'current_selection_data' not in st.session_state: st.session_state['current_selection_data'] = None
 if 'search_provider' not in st.session_state: st.session_state['search_provider'] = "Apple Books"
-if 'last_jumped_path' not in st.session_state: st.session_state['last_jumped_path'] = None
-# Stores manually created bundles
 if 'manual_books' not in st.session_state: st.session_state['manual_books'] = []
+# Tracks the last book we synced to prevent infinite loops
+if 'last_synced_book_id' not in st.session_state: st.session_state['last_synced_book_id'] = None
 
 # --- Persistence ---
 def load_json(filepath, default=None):
@@ -163,18 +163,21 @@ def get_candidates_with_status():
     all_candidates = manual_items + raw_candidates
     
     history = load_json(HISTORY_FILE, [])
-    cached_lib = load_json(CACHE_FILE, None)
-    library_items = cached_lib if (cached_lib and isinstance(cached_lib, list)) else []
+    
+    cached_lib = load_json(CACHE_FILE, [])
+    if not cached_lib: cached_lib = scan_library_now()
+    library_items = cached_lib
     
     final_list = []
     
     for data in all_candidates:
         unique_id = data['id']
+        path_str = data['path']
         clean_dl = data['clean']
         status = 0 
         match_path = None
         
-        if unique_id in history:
+        if unique_id in history or path_str in history:
             status = 3
         elif library_items:
             for lib_item in library_items:
@@ -284,11 +287,12 @@ def process_selection(source_data, author, title, series, series_part, desc, cov
 
     files_to_process.sort()
     total = len(files_to_process)
+    pad = max(2, len(str(total)))
     
     bar = st.progress(0)
     for i, src in enumerate(files_to_process):
         ext = os.path.splitext(src)[1]
-        name = f"{str(i+1).zfill(max(2, len(str(total))))} - {clean_title}{ext}"
+        name = f"{str(i+1).zfill(pad)} - {clean_title}{ext}" if total > 1 else f"{clean_title}{ext}"
         dst = os.path.join(dest_base, name)
         
         if mode == "FIX" and os.path.abspath(src) != os.path.abspath(dst): shutil.move(src, dst)
@@ -312,9 +316,9 @@ def process_selection(source_data, author, title, series, series_part, desc, cov
     with open(os.path.join(dest_base, "metadata.json"), 'w') as f: json.dump(abs_meta, f, indent=4)
 
     hist = load_json(HISTORY_FILE, [])
-    if source_data['unique_id'] not in hist:
-        hist.append(source_data['unique_id'])
-        save_json(HISTORY_FILE, hist)
+    if source_data['unique_id'] not in hist: hist.append(source_data['unique_id'])
+    if source_data['path'] not in hist: hist.append(source_data['path'])
+    save_json(HISTORY_FILE, hist)
     
     if source_data.get('is_manual'):
         st.session_state['manual_books'] = [b for b in st.session_state['manual_books'] if b['id'] != source_data['unique_id']]
@@ -326,25 +330,26 @@ def process_selection(source_data, author, title, series, series_part, desc, cov
     st.rerun()
 
 # --- MAIN LAYOUT (3 Columns) ---
-# Column 1: Queue | Column 2: Editor | Column 3: Explorer
 col1, col2, col3 = st.columns([1.5, 2, 1.5])
 
-# ==================== COLUMN 1: QUEUE & LISTS ====================
+# ==================== COLUMN 1: QUEUE ====================
 all_items = get_candidates_with_status()
 new_items = [x for x in all_items if x['status_code'] == 0]
 existing_items = [x for x in all_items if x['status_code'] > 0]
 
-# Sync: Explorer -> Queue
+# --- SYNC HANDLER: Explorer -> Queue ---
 if st.session_state['sync_selection']:
     sync_target = st.session_state['sync_selection']
     matching = [x for x in all_items if x['path'] == sync_target or sync_target.startswith(x['path'])]
     if matching:
         st.session_state['current_selection_data'] = matching[0]
         st.toast(f"Matched: {matching[0]['name']}")
+        # Clear Sync Target
         st.session_state['sync_selection'] = None
 
 with col1:
     tab_new, tab_exist = st.tabs(["🆕 Untidy Queue", "📚 Imported"])
+    
     with tab_new:
         if not new_items:
             st.info("Queue Empty.")
@@ -373,12 +378,18 @@ with col1:
             if sel_exist.selection.rows:
                 st.session_state['current_selection_data'] = existing_items[sel_exist.selection.rows[0]]
 
-# Sync: Queue -> Explorer
+# --- SYNC HANDLER: Queue -> Explorer ---
 selected_item = st.session_state.get('current_selection_data')
 if selected_item:
-    if selected_item['path'] != st.session_state.get('last_jumped_path'):
-        st.session_state['exp_path'] = os.path.dirname(selected_item['path']) if os.path.isfile(selected_item['path']) else selected_item['path']
-        st.session_state['last_jumped_path'] = selected_item['path']
+    # Get the target path (Parent folder if file)
+    target_path = selected_item['path']
+    if os.path.isfile(target_path):
+        target_path = os.path.dirname(target_path)
+    
+    # If this is a NEW selection, trigger the explorer jump
+    if st.session_state['last_synced_book_id'] != selected_item['unique_id']:
+        st.session_state['exp_path'] = target_path
+        st.session_state['last_synced_book_id'] = selected_item['unique_id']
         st.rerun()
 
 # ==================== COLUMN 2: EDITOR ====================
@@ -388,6 +399,7 @@ with col2:
         st.caption(f"Path: `{selected_item['path']}`")
         if st.button("❌ Close Editor"):
             st.session_state['current_selection_data'] = None
+            st.session_state['last_synced_book_id'] = None
             st.rerun()
             
         c_src, c_bar, c_btn = st.columns([1, 2, 1])
@@ -448,12 +460,11 @@ with col2:
     else:
         st.info("👈 Select a book to edit.")
 
-# ==================== COLUMN 3: EXPLORER & BUILDER ====================
+# ==================== COLUMN 3: EXPLORER ====================
 with col3:
     st.subheader("📂 Explorer & Builder")
     curr_path = st.session_state['exp_path']
     
-    # Breadcrumb / Up
     col_u, col_p = st.columns([0.2, 0.8])
     with col_u:
         if st.button("⬆️"):
@@ -474,7 +485,6 @@ with col3:
         if file_list:
             df_files = pd.DataFrame(file_list)
             
-            # --- MULTI SELECT TABLE ---
             sel_files = st.dataframe(
                 df_files[['icon', 'name']],
                 column_config={"icon": st.column_config.TextColumn("", width="small")},
@@ -482,28 +492,25 @@ with col3:
                 on_select="rerun", selection_mode="multi-row"
             )
             
-            # Handle Selections
+            # Selection Handling
             selected_rows = sel_files.selection.rows
             
             if selected_rows:
-                # Get the actual items
                 selection_data = [file_list[i] for i in selected_rows]
                 st.markdown("---")
-                st.caption(f"Selected: {len(selection_data)} items")
                 
-                # Logic 1: Navigation (Single Folder)
+                # Nav Logic
                 if len(selection_data) == 1 and selection_data[0]['type'] == 'dir':
                     if st.button(f"📂 Open '{selection_data[0]['name']}'"):
                         st.session_state['exp_path'] = selection_data[0]['path']
-                        # Trigger sync to Queue if it matches a book
+                        # Trigger Sync to Queue
                         st.session_state['sync_selection'] = selection_data[0]['path']
                         st.rerun()
                         
-                # Logic 2: Manual Bundle
+                # Manual Bundle Logic
                 with st.form("manual_bundle"):
                     new_name = st.text_input("New Book Title", value=selection_data[0]['name'])
                     if st.form_submit_button("✨ Bundle as Book"):
-                        # Collect all files (recurse if folder selected)
                         final_paths = []
                         for item in selection_data:
                             if item['type'] == 'dir':
