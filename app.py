@@ -235,4 +235,121 @@ def process_selection(source_data, author, title, series, series_part, desc, cov
         "publishYear": publish_year,
         "cover": cover_url
     }
-    if series
+    if series and series_part:
+        try: abs_metadata["series"] = [{"sequence": series_part, "name": series}]
+        except: abs_metadata["series"] = [series]
+
+    with open(os.path.join(dest_base_folder, "metadata.json"), 'w', encoding='utf-8') as f:
+        json.dump(abs_metadata, f, indent=4)
+
+    # Add to history
+    history = load_json(HISTORY_FILE, [])
+    if source_data['path'] not in history:
+        history.append(source_data['path'])
+        save_json(HISTORY_FILE, history)
+        
+    # Invalidate Cache if we added a new book to library (Status 0)
+    if mode == "COPY":
+        # We assume the library changed, so we force a refresh next time or update cache manually
+        # Simplest is to just delete cache file to force rebuild on next load
+        if os.path.exists(CACHE_FILE):
+            os.remove(CACHE_FILE)
+
+    st.success(f"✅ Done: {clean_title}")
+    st.balloons()
+    time.sleep(1)
+    st.rerun()
+
+# --- GUI Layout ---
+st.title("🎧 TidyBooks")
+
+col1, col2 = st.columns([1, 2])
+
+with col1:
+    st.subheader("📂 Untidy Queue")
+    
+    # Force Refresh Button
+    if st.button("🔄 Force Refresh Library"):
+        st.cache_data.clear()
+        if os.path.exists(CACHE_FILE): os.remove(CACHE_FILE)
+        st.rerun()
+
+    # Load candidates (uses cache unless forced)
+    items = get_candidates()
+    
+    if not items:
+        st.info("No items found.")
+        selected_item = None
+    else:
+        selected_label = st.radio("Select Book:", [x['label'] for x in items], index=0)
+        selected_item = next((x for x in items if x['label'] == selected_label), None)
+
+with col2:
+    if selected_item:
+        folder_name = selected_item['name']
+        
+        if selected_item['status'] == 1:
+            st.warning("⚠️ **Found in Library:** Will FIX structure (Move).")
+        elif selected_item['status'] == 2:
+            st.success("✅ **Processed:** Already in history.")
+
+        st.subheader("✏️ Book Details")
+        st.caption(f"Target: `{folder_name}`")
+        
+        with st.expander("🔍 Search Database", expanded=True):
+            c_search, c_btn = st.columns([3,1])
+            with c_search:
+                clean_guess = folder_name.replace("_", " ").replace("-", " ")
+                search_query = st.text_input("Search Title", value=clean_guess)
+            with c_btn:
+                st.write("##")
+                do_search = st.button("Search")
+            
+            found_meta = {}
+            if do_search:
+                results = fetch_metadata(search_query)
+                if results:
+                    st.session_state['search_results'] = results
+            
+            if 'search_results' in st.session_state:
+                options = {f"{b.get('authors')} - {b.get('title')}": b for b in st.session_state['search_results']}
+                selected_meta_key = st.selectbox("Quick Fill:", options.keys())
+                if selected_meta_key:
+                    found_meta = options[selected_meta_key]
+
+        with st.form("book_details"):
+            f_auth = found_meta.get('authors', '')
+            f_title = found_meta.get('title', '')
+            f_series = found_meta.get('seriesPrimary', '')
+            f_part = found_meta.get('seriesPrimarySequence', '')
+            f_desc = found_meta.get('summary', '')
+            f_img = found_meta.get('image', '')
+            f_narr = found_meta.get('narrators', '')
+            f_year = found_meta.get('releaseDate', '')[:4] if found_meta.get('releaseDate') else ''
+
+            c1, c2 = st.columns(2)
+            with c1:
+                new_author = st.text_input("Author", value=f_auth)
+                new_title = st.text_input("Title", value=f_title)
+                new_narrator = st.text_input("Narrator", value=f_narr)
+            with c2:
+                new_series = st.text_input("Series Name", value=f_series)
+                new_part = st.text_input("Series Part #", value=f_part)
+                new_year = st.text_input("Year", value=f_year)
+            
+            new_desc = st.text_area("Description", value=f_desc, height=150)
+            cover_img = st.text_input("Cover Image URL", value=f_img)
+
+            if cover_img:
+                st.image(cover_img, width=120)
+
+            st.write("---")
+            btn_label = "🚀 Make Tidy & Import"
+            if selected_item['status'] == 1:
+                btn_label = "🛠️ Fix Library Structure (Move)"
+            
+            submitted = st.form_submit_button(btn_label, type="primary")
+            
+            if submitted:
+                if new_author and new_title:
+                    process_selection(selected_item, new_author, new_title, new_series, new_part, new_desc, cover_img, new_narrator, new_year)
