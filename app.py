@@ -39,12 +39,13 @@ def get_library_map(force_refresh=False):
     """
     if not force_refresh:
         cached = load_json(CACHE_FILE, None)
-        if cached: return cached
+        # FIX: Check if cached data is a list. If it's a dict (old format), ignore it.
+        if cached and isinstance(cached, list): 
+            return cached
             
     library_items = []
     # Walk library to find leaf folders (folders that contain files, not just other folders)
     for root, dirs, files in os.walk(LIBRARY_DIR):
-        # Heuristic: A "Book Folder" is one that contains audio files OR is a leaf node
         has_audio = any(f.lower().endswith(('.mp3', '.m4b', '.m4a', '.flac')) for f in files)
         
         if has_audio:
@@ -60,15 +61,9 @@ def get_library_map(force_refresh=False):
 
 # --- Helper Functions ---
 def sanitize_for_matching(text):
-    """
-    Simplifies text for fuzzy matching.
-    'Harry Potter - The Chamber of Secrets (2002)' -> 'harrypotterthechamberofsecrets'
-    """
     if not text: return ""
     text = text.lower()
-    # Remove common junk words
     text = re.sub(r'\b(audiobook|mp3|m4b|cd|disc|part|v|vol|chapter)\b', '', text)
-    # Remove digits and special chars to match pure titles
     text = re.sub(r'[^a-z]', '', text) 
     return text
 
@@ -105,16 +100,13 @@ def get_candidates(force_refresh=False):
             folder_name = os.path.basename(root)
             if is_junk_folder(folder_name): continue
 
-            # Skip if it has real subfolders
             has_real_subfolders = any(not d.startswith('.') for d in dirs)
             if has_real_subfolders: continue
 
-            # "Bubble Up" logic for CD/Part folders
             target_path = root
             target_name = folder_name
             parent_path = os.path.dirname(root)
             
-            # Simple check: if folder is just numbers or 'CD 1', use parent
             if re.match(r'^(cd|disc|part|vol|chapter)?\s*\d+$', folder_name, re.IGNORECASE):
                  if os.path.abspath(parent_path) != os.path.abspath(DOWNLOAD_DIR):
                      target_path = parent_path
@@ -134,30 +126,24 @@ def get_candidates(force_refresh=False):
         clean_dl = data['clean']
         full_path = data['path']
         
-        status = 0 # 0=White, 1=Yellow, 2=Green, 3=HistoryGreen
+        status = 0 
         match_path = None
         
-        # 1. HISTORY CHECK (Strongest Green)
         if full_path in history:
             status = 3
         else:
-            # 2. LIBRARY MATCHING
-            # Try to find a library item where the cleaned names overlap significantly
             for lib_item in library_items:
                 clean_lib = lib_item['clean']
                 if not clean_lib: continue
                 
-                # Logic: If one cleaned string contains the other (and is at least 5 chars to avoid small matches)
                 if len(clean_lib) > 4 and (clean_lib in clean_dl or clean_dl in clean_lib):
                     match_path = lib_item['path']
-                    # Check for metadata.json
                     if os.path.exists(os.path.join(match_path, "metadata.json")):
                         status = 2
                     else:
                         status = 1
                     break
         
-        # UI Labels
         prefix = ""
         if status == 3: prefix = "✅ (History) "
         elif status == 2: prefix = "✅ "
@@ -172,10 +158,6 @@ def get_candidates(force_refresh=False):
             "name": folder_name
         })
 
-    # Sort: Green/History at bottom (Status 2,3), Yellow (1), White (0) at top
-    # We want 0 and 1 at top. 2 and 3 at bottom.
-    # Sorted key: (is_done, status_priority, name)
-    # is_done: 0 for White/Yellow, 1 for Green/History
     return sorted(final_list, key=lambda x: (1 if x['status'] >= 2 else 0, x['status'] == 2, x['name']))
 
 def fetch_metadata(query):
@@ -188,157 +170,6 @@ def fetch_metadata(query):
     return []
 
 def tag_file(file_path, author, title, series, desc, cover_url, year, track_num, total_tracks):
-    # (Same tagging logic as before - abbreviated for space but functionality remains)
     ext = os.path.splitext(file_path)[1].lower()
     try:
-        if ext in ['.m4b', '.m4a']:
-            audio = MP4(file_path)
-            if audio.tags is None: audio.add_tags()
-            audio.tags['\xa9nam'] = title; audio.tags['\xa9ART'] = author
-            audio.tags['\xa9alb'] = series if series else title; audio.tags['desc'] = desc
-            audio.tags['trkn'] = [(track_num, total_tracks)]
-            if year: audio.tags['\xa9day'] = year
-            if cover_url:
-                audio.tags['covr'] = [MP4Cover(requests.get(cover_url).content, imageformat=MP4Cover.FORMAT_JPEG)]
-            audio.save()
-        elif ext == '.mp3':
-            try: audio = ID3(file_path) 
-            except: audio = ID3()
-            audio.add(TIT2(encoding=3, text=title)); audio.add(TPE1(encoding=3, text=author))
-            audio.add(TALB(encoding=3, text=series if series else title))
-            audio.add(TRCK(encoding=3, text=f"{track_num}/{total_tracks}"))
-            if desc: audio.add(COMM(encoding=3, lang='eng', desc='Description', text=desc))
-            if cover_url:
-                audio.add(APIC(3, 'image/jpeg', 3, 'Front Cover', requests.get(cover_url).content))
-            audio.save(file_path)
-    except: pass
-
-def process_selection(source_data, author, title, series, series_part, desc, cover_url, narrator, publish_year):
-    mode = "COPY"
-    working_source_path = source_data['path']
-    if source_data['status'] == 1 and source_data['match_path']:
-        mode = "FIX"
-        working_source_path = source_data['match_path']
-
-    clean_author = sanitize_filename(author, True)
-    clean_title = sanitize_filename(title, True)
-    clean_series = sanitize_filename(series, False)
-    
-    dest_base = os.path.join(LIBRARY_DIR, clean_author, clean_series, clean_title) if clean_series else os.path.join(LIBRARY_DIR, clean_author, clean_title)
-    os.makedirs(dest_base, exist_ok=True)
-
-    files = []
-    for root, _, fs in os.walk(working_source_path):
-        for f in fs:
-            if f.lower().endswith(('.mp3', '.m4b', '.m4a', '.flac')):
-                files.append(os.path.join(root, f))
-    files.sort()
-    
-    total = len(files)
-    pad = max(2, len(str(total)))
-    
-    bar = st.progress(0)
-    
-    for i, src in enumerate(files):
-        ext = os.path.splitext(src)[1]
-        name = f"{str(i+1).zfill(pad)} - {clean_title}{ext}" if total > 1 else f"{clean_title}{ext}"
-        dst = os.path.join(dest_base, name)
-        
-        if mode == "FIX" and os.path.abspath(src) != os.path.abspath(dst): shutil.move(src, dst)
-        else: shutil.copy2(src, dst)
-        
-        tag_file(dst, author, title, series, desc, cover_url, publish_year, i+1, total)
-        bar.progress((i+1)/total)
-
-    if mode == "FIX": 
-        try: shutil.rmtree(working_source_path) 
-        except: pass
-
-    abs_meta = {
-        "title": title, "authors": [author], "series": [series] if series else [],
-        "description": desc, "narrators": [narrator] if narrator else [],
-        "publishYear": publish_year, "cover": cover_url
-    }
-    if series and series_part:
-        try: abs_meta["series"] = [{"sequence": series_part, "name": series}]
-        except: abs_meta["series"] = [series]
-
-    with open(os.path.join(dest_base, "metadata.json"), 'w') as f: json.dump(abs_meta, f, indent=4)
-
-    # History & Cache Update
-    hist = load_json(HISTORY_FILE, [])
-    if source_data['path'] not in hist:
-        hist.append(source_data['path'])
-        save_json(HISTORY_FILE, hist)
-    
-    if os.path.exists(CACHE_FILE): os.remove(CACHE_FILE)
-    
-    st.success(f"✅ Done: {clean_title}")
-    time.sleep(1)
-    st.rerun()
-
-# --- MAIN UI ---
-st.sidebar.title("🛠️ Tools")
-
-# --- DEBUG INSPECTOR ---
-with st.sidebar.expander("🐞 Library Inspector"):
-    if st.button("Force Re-Scan Library"):
-        if os.path.exists(CACHE_FILE): os.remove(CACHE_FILE)
-        st.rerun()
-        
-    lib_data = get_library_map()
-    st.write(f"**Found {len(lib_data)} Books in Library**")
-    st.write("First 5 entries found:")
-    for item in lib_data[:5]:
-        st.code(f"Name: {item['name']}\nClean: {item['clean']}")
-
-col1, col2 = st.columns([1, 2])
-
-with col1:
-    st.subheader("📂 Untidy Queue")
-    items = get_candidates()
-    if not items:
-        st.info("Queue Empty.")
-        selected_item = None
-    else:
-        label_map = {f"{x['label']}##{i}": x for i, x in enumerate(items)}
-        key = st.radio("Select Book", list(label_map.keys()), format_func=lambda k: label_map[k]['label'].split('##')[0])
-        selected_item = label_map[key]
-
-with col2:
-    if selected_item:
-        st.subheader("✏️ Editor")
-        st.caption(f"Path: `{selected_item['name']}`")
-        
-        # Search
-        clean_q = clean_search_query(selected_item['name'])
-        q = st.text_input("Search", value=clean_q)
-        if st.button("Search"):
-            res = fetch_metadata(q)
-            if res: st.session_state['res'] = res
-            
-        found = {}
-        if 'res' in st.session_state:
-            opts = {f"{b.get('authors')} - {b.get('title')}": b for b in st.session_state['res']}
-            sel = st.selectbox("Results", opts.keys())
-            if sel: found = opts[sel]
-
-        # Form
-        with st.form("main"):
-            c1, c2 = st.columns(2)
-            auth = c1.text_input("Author", found.get('authors',''))
-            titl = c1.text_input("Title", found.get('title',''))
-            narr = c1.text_input("Narrator", found.get('narrators',''))
-            seri = c2.text_input("Series", found.get('seriesPrimary',''))
-            part = c2.text_input("Part #", found.get('seriesPrimarySequence',''))
-            year = c2.text_input("Year", found.get('releaseDate','')[:4] if found.get('releaseDate') else '')
-            desc = st.text_area("Desc", found.get('summary',''))
-            img = st.text_input("Cover URL", found.get('image',''))
-            if img: st.image(img, width=100)
-            
-            lbl = "Make Tidy & Import"
-            if selected_item['status'] == 1: lbl = "Fix Structure (Move)"
-            if st.form_submit_button(lbl, type="primary"):
-                if auth and titl:
-                    process_selection(selected_item, auth, titl, seri, part, desc, img, narr, year)
-                else: st.error("Author/Title Required")
+        if ext in ['.m4b', '.m4
