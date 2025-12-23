@@ -47,10 +47,22 @@ def get_library_map(force_refresh=False):
         return {}
 
 # --- Helper Functions ---
-def sanitize_filename(name):
-    if not name: return "Unknown"
+def sanitize_filename(name, default_to_unknown=False):
+    """
+    Cleans filename. 
+    If default_to_unknown is True (for Author/Title), returns 'Unknown' if empty.
+    If False (for Series), returns empty string if empty.
+    """
+    if not name:
+        return "Unknown" if default_to_unknown else ""
+        
     clean = name.replace("/", "-").replace("\\", "-")
-    return re.sub(r'[<>:"|?*]', '', clean).strip()
+    clean = re.sub(r'[<>:"|?*]', '', clean).strip()
+    
+    if not clean and default_to_unknown:
+        return "Unknown"
+        
+    return clean
 
 def is_part_folder(folder_name):
     pattern = r"^(cd|disc|disk|part|vol|volume|chapter)\s*[\d\w]+$"
@@ -64,19 +76,10 @@ def is_junk_folder(folder_name):
     return folder_name.lower() in junk
 
 def clean_search_query(text):
-    """
-    Aggressively cleans torrent folder names for better search results.
-    Removes: (2021), [128k], {Audiobook}, - AuthorName
-    """
-    # 1. Remove content inside brackets (), [], {}
     text = re.sub(r'[\(\[\{].*?[\)\]\}]', '', text)
-    # 2. Remove common file info keywords
     text = re.sub(r'\b(mp3|m4b|128k|64k|192k|aac)\b', '', text, flags=re.IGNORECASE)
-    # 3. Remove CD/Part numbering
     text = re.sub(r'\b(cd|disc|part|vol|v)\s*\d+\b', '', text, flags=re.IGNORECASE)
-    # 4. Replace separators with spaces
     text = text.replace('.', ' ').replace('_', ' ').replace('-', ' ')
-    # 5. Collapse multiple spaces
     return re.sub(r'\s+', ' ', text).strip()
 
 def get_candidates(force_refresh=False):
@@ -96,10 +99,9 @@ def get_candidates(force_refresh=False):
             parent_path = os.path.dirname(root)
             parent_name = os.path.basename(parent_path)
             
-            # --- STRICT FILTERING ---
             if is_junk_folder(folder_name): continue
 
-            # Skip if contains subfolders (unless hidden)
+            # Skip subfolders unless they are hidden
             has_real_subfolders = False
             for d in dirs:
                 if not d.startswith('.'): 
@@ -160,7 +162,6 @@ def fetch_metadata(query):
     try:
         headers = {'User-Agent': 'TidyBooks/1.0'}
         params = {'q': query}
-        # Increased timeout to 15 seconds
         r = requests.get(AUDNEXUS_API, params=params, headers=headers, timeout=15)
         if r.status_code == 200:
             return r.json()
@@ -212,10 +213,12 @@ def process_selection(source_data, author, title, series, series_part, desc, cov
         mode = "FIX"
         working_source_path = source_data['match_path']
 
-    clean_author = sanitize_filename(author)
-    clean_title = sanitize_filename(title)
-    clean_series = sanitize_filename(series)
+    # --- UPDATED SANITIZATION CALLS ---
+    clean_author = sanitize_filename(author, default_to_unknown=True)
+    clean_title = sanitize_filename(title, default_to_unknown=True)
+    clean_series = sanitize_filename(series, default_to_unknown=False) # Allows empty string
     
+    # Logic: Only create series folder if clean_series is not empty
     if clean_series:
         dest_base_folder = os.path.join(LIBRARY_DIR, clean_author, clean_series, clean_title)
     else:
@@ -331,7 +334,6 @@ with col2:
         with st.expander("🔍 Search Database", expanded=True):
             c_search, c_btn = st.columns([3,1])
             with c_search:
-                # Use our new cleaner function
                 clean_guess = clean_search_query(folder_name)
                 search_query = st.text_input("Search Title", value=clean_guess)
             with c_btn:
