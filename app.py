@@ -8,7 +8,6 @@ import re
 import time
 from mutagen.mp4 import MP4, MP4Cover
 from mutagen.id3 import ID3, TIT2, TPE1, TALB, APIC, COMM, TRCK
-import difflib # For string similarity
 
 # --- Configuration ---
 DOWNLOAD_DIR = "/downloads"
@@ -18,7 +17,6 @@ HISTORY_FILE = os.path.join(DATA_DIR, "processed_log.json")
 CACHE_FILE = os.path.join(DATA_DIR, "library_map_cache.json")
 
 # API ENDPOINTS
-AUDNEXUS_API = "https://api.audnex.us/books"
 ITUNES_API = "https://itunes.apple.com/search"
 GOOGLE_BOOKS_API = "https://www.googleapis.com/books/v1/volumes"
 
@@ -34,8 +32,10 @@ if 'exp_path' not in st.session_state: st.session_state['exp_path'] = DOWNLOAD_D
 if 'exp_root' not in st.session_state: st.session_state['exp_root'] = DOWNLOAD_DIR
 if 'sync_selection' not in st.session_state: st.session_state['sync_selection'] = None
 if 'current_selection_data' not in st.session_state: st.session_state['current_selection_data'] = None
-if 'search_provider' not in st.session_state: st.session_state['search_provider'] = "Audible"
+if 'search_provider' not in st.session_state: st.session_state['search_provider'] = "Apple Books"
 if 'last_jumped_path' not in st.session_state: st.session_state['last_jumped_path'] = None
+# New: Store manually created books
+if 'manual_books' not in st.session_state: st.session_state['manual_books'] = []
 
 # --- Persistence ---
 def load_json(filepath, default=None):
@@ -75,19 +75,17 @@ def clean_search_query(text):
 
 def get_file_stem(filename):
     """
-    Reduces a filename to its 'Core Identity' to group multi-part files.
-    Ex: "Harry Potter 1 - Part 01.mp3" -> "harrypotter1"
+    Used ONLY for Collection folders to group files by name.
     """
     name = os.path.splitext(filename)[0].lower()
-    # Remove common separators
+    name = re.sub(r'[\(\[\{].*?[\)\]\}]', ' ', name)
+    name = re.sub(r'\b(part|pt|cd|disc|disk|track|chapter|vol|volume)\s*\d+\b', ' ', name)
     name = re.sub(r'[_\-\.]', ' ', name)
-    # Remove common 'part' indicators
-    name = re.sub(r'\b(part|pt|cd|disc|disk|track|chapter)\s*\d+\b', '', name)
-    # Remove standalone numbers at the end (often track numbers)
-    name = re.sub(r'\s+\d+$', '', name)
-    # Remove brackets
-    name = re.sub(r'[\(\[].*?[\)\]]', '', name)
+    name = re.sub(r'\b\d+\b', ' ', name)
     return re.sub(r'\s+', ' ', name).strip()
+
+def natural_keys(text):
+    return [int(c) if c.isdigit() else c.lower() for c in re.split(r'(\d+)', text)]
 
 # --- Cached Operations ---
 def scan_library_now():
@@ -104,13 +102,13 @@ def scan_library_now():
     save_json(CACHE_FILE, library_items)
     return library_items
 
-# --- SMART GROUPING SCANNER ---
+# --- HYBRID SCANNER ---
 @st.cache_data(ttl=600, show_spinner="Scanning downloads...")
 def scan_downloads_snapshot():
     if not os.path.exists(DOWNLOAD_DIR): return []
     
     candidates = []
-    seen_ids = set() # To prevent duplicates
+    seen_ids = set() 
 
     for root, dirs, files in os.walk(DOWNLOAD_DIR):
         audio_files = [f for f in files if f.lower().endswith(('.mp3', '.m4b', '.m4a', '.flac'))]
@@ -119,56 +117,84 @@ def scan_downloads_snapshot():
             folder_name = os.path.basename(root)
             if is_junk_folder(folder_name): continue
             
-            # Logic: Group files by similarity
-            groups = {}
-            
-            for f in audio_files:
-                # Get the "Stem" (Core Name)
-                stem = get_file_stem(f)
-                if not stem: stem = "unknown" # Fallback
+            # 1. SPECIAL CASE: "Collection" folders
+            if "collection" in folder_name.lower():
+                groups = {}
+                for f in audio_files:
+                    stem = get_file_stem(f)
+                    if not stem: stem = "unknown"
+                    if stem not in groups: groups[stem] = []
+                    groups[stem].append(f)
                 
-                if stem not in groups: groups[stem] = []
-                groups[stem].append(f)
-            
-            # Create a candidate entry for EACH group found in the folder
-            for stem, file_list in groups.items():
-                # We use a unique ID based on path + stem to track history
-                unique_id = f"{root}|{stem}"
+                for stem, file_list in groups.items():
+                    unique_id = f"{root}|{stem}"
+                    display_name = stem.title()
+                    full_paths = [os.path.join(root, f) for f in file_list]
+                    
+                    candidates.append({
+                        "id": unique_id,
+                        "path": root,
+                        "name": display_name,
+                        "clean": sanitize_for_matching(display_name),
+                        "file_list": full_paths,
+                        "is_group": True 
+                    })
+
+            # 2. STANDARD CASE: One Folder = One Book
+            else:
+                has_real_subfolders = any(not d.startswith('.') for d in dirs)
+                if has_real_subfolders: continue 
+
+                target_path = root
+                target_name = folder_name
+                parent_path = os.path.dirname(root)
                 
-                # Determine display name
-                # If the folder only has one group, use the Folder Name (cleaner)
-                # If the folder has multiple groups (Mixed Collection), use the Stem
-                display_name = folder_name if len(groups) == 1 else stem.title()
+                if re.match(r'^(cd|disc|part|vol|chapter)?\s*\d+$', folder_name, re.IGNORECASE):
+                     if os.path.abspath(parent_path) != os.path.abspath(DOWNLOAD_DIR):
+                         target_path = parent_path
+                         target_name = os.path.basename(parent_path)
+
+                unique_id = f"{target_path}|FOLDER"
                 
-                # If we are splitting a folder, we must pass the specific file list
-                full_paths = [os.path.join(root, f) for f in file_list]
-                
-                candidates.append({
-                    "id": unique_id,
-                    "path": root, # Base path is still the folder
-                    "name": display_name,
-                    "clean": sanitize_for_matching(display_name),
-                    "file_list": full_paths, # Only operate on THESE files
-                    "is_group": len(groups) > 1 # Flag to tell UI this is a split
-                })
+                if unique_id not in seen_ids:
+                    seen_ids.add(unique_id)
+                    all_paths = [os.path.join(root, f) for f in audio_files]
+                    
+                    candidates.append({
+                        "id": unique_id,
+                        "path": target_path,
+                        "name": target_name,
+                        "clean": sanitize_for_matching(target_name),
+                        "file_list": all_paths,
+                        "is_group": False
+                    })
 
     return candidates
 
 def get_candidates_with_status():
+    # 1. Get Auto-Scanned Items
     raw_candidates = scan_downloads_snapshot()
+    
+    # 2. Get Manually Created Items (from Session State)
+    # We prepend these so they appear at the top
+    manual_items = st.session_state.get('manual_books', [])
+    
+    # Combine lists
+    all_candidates = manual_items + raw_candidates
+    
     history = load_json(HISTORY_FILE, [])
     cached_lib = load_json(CACHE_FILE, None)
     library_items = cached_lib if (cached_lib and isinstance(cached_lib, list)) else []
     
     final_list = []
-    for data in raw_candidates:
+    
+    for data in all_candidates:
         unique_id = data['id']
         clean_dl = data['clean']
         
         status = 0 
         match_path = None
         
-        # Check History using Unique ID (so we don't re-import the same split group)
         if unique_id in history:
             status = 3
         elif library_items:
@@ -188,41 +214,25 @@ def get_candidates_with_status():
         elif status == 2: status_icon = "✅"
         elif status == 1: status_icon = "🟡"
         
+        # Add visual indicator for manual items
+        display_name = data['name']
+        if data.get('is_manual'):
+            display_name = f"🛠️ {display_name}"
+        
         final_list.append({
-            "path": data['path'], # Used for Explorer jump
+            "path": data['path'], 
             "unique_id": unique_id,
-            "name": data['name'],
+            "name": display_name,
+            "raw_name": data['name'], # Used for sorting
             "status_code": status,
             "State": status_icon, 
             "match_path": match_path,
             "file_list": data['file_list']
         })
-    return final_list
+
+    return sorted(final_list, key=lambda x: (x['status_code'] > 0, natural_keys(x['raw_name'])))
 
 # --- SEARCH ---
-def fetch_audnexus(query):
-    try:
-        r = requests.get(AUDNEXUS_API, params={'q': query}, timeout=10)
-        r.raise_for_status()
-        data = r.json()
-        results = []
-        for b in data:
-            results.append({
-                "title": b.get('title'),
-                "authors": ", ".join(b.get('authors', [])),
-                "narrators": ", ".join(b.get('narrators', [])),
-                "seriesPrimary": b.get('seriesPrimary', ''),
-                "seriesPrimarySequence": b.get('seriesPrimarySequence', ''),
-                "summary": b.get('summary', ''),
-                "image": b.get('image', ''),
-                "releaseDate": b.get('releaseDate', ''),
-                "source": "Audible"
-            })
-        return results
-    except Exception as e:
-        st.error(f"Audible Error: {e}")
-        return []
-
 def fetch_itunes(query):
     try:
         r = requests.get(ITUNES_API, params={'term': query, 'media': 'audiobook', 'limit': 10}, timeout=10)
@@ -274,8 +284,7 @@ def fetch_google(query):
         return []
 
 def fetch_metadata_router(query, provider):
-    if provider == "Audible": return fetch_audnexus(query)
-    elif provider == "Apple Books": return fetch_itunes(query)
+    if provider == "Apple Books": return fetch_itunes(query)
     else: return fetch_google(query)
 
 # --- PROCESSING ---
@@ -308,17 +317,16 @@ def tag_file(file_path, author, title, series, desc, cover_url, year, track_num,
 
 def process_selection(source_data, author, title, series, series_part, desc, cover_url, narrator, publish_year):
     mode = "COPY"
-    # We use the specific list of files determined by the grouper
     files_to_process = source_data['file_list']
     
-    # If fixing an existing messy import, we might move the whole folder
-    # But for split groups, we are essentially "extracting" them
     if source_data['status_code'] == 1 and source_data['match_path']:
         mode = "FIX"
-        # For fix, we assume we are moving the files found in the match path
-        # But honestly, for split groups, FIX logic is complex. 
-        # Safest is to treat split groups as COPY/MOVE individual files.
-        pass 
+        working_source_path = source_data['match_path']
+        files_to_process = []
+        for root, _, fs in os.walk(working_source_path):
+            for f in fs:
+                if f.lower().endswith(('.mp3', '.m4b', '.m4a', '.flac')):
+                    files_to_process.append(os.path.join(root, f))
 
     clean_author = sanitize_filename(author, True)
     clean_title = sanitize_filename(title, True)
@@ -337,13 +345,14 @@ def process_selection(source_data, author, title, series, series_part, desc, cov
         name = f"{str(i+1).zfill(pad)} - {clean_title}{ext}" if total > 1 else f"{clean_title}{ext}"
         dst = os.path.join(dest_base, name)
         
-        # Always COPY first to be safe with split collections, unless we implement specific move logic
-        shutil.copy2(src, dst)
+        if mode == "FIX" and os.path.abspath(src) != os.path.abspath(dst): shutil.move(src, dst)
+        else: shutil.copy2(src, dst)
         tag_file(dst, author, title, series, desc, cover_url, publish_year, i+1, total)
         bar.progress((i+1)/total)
 
-    # Note: We do NOT delete source folders automatically for split groups 
-    # because other books might still be in there.
+    if mode == "FIX" and source_data.get('match_path'): 
+        try: shutil.rmtree(source_data['match_path']) 
+        except: pass
 
     abs_meta = {
         "title": title, "authors": [author], "series": [series] if series else [],
@@ -357,11 +366,14 @@ def process_selection(source_data, author, title, series, series_part, desc, cov
     with open(os.path.join(dest_base, "metadata.json"), 'w') as f: json.dump(abs_meta, f, indent=4)
 
     hist = load_json(HISTORY_FILE, [])
-    # Save the UNIQUE ID (Folder|Stem) so we don't import this specific book group again
     if source_data['unique_id'] not in hist:
         hist.append(source_data['unique_id'])
         save_json(HISTORY_FILE, hist)
     
+    # If it was a manual book, remove it from the manual list now that it's processed
+    if source_data.get('is_manual'):
+        st.session_state['manual_books'] = [b for b in st.session_state['manual_books'] if b['id'] != source_data['unique_id']]
+
     st.success(f"✅ Done: {clean_title}")
     st.cache_data.clear()
     st.session_state['current_selection_data'] = None
@@ -382,6 +394,7 @@ if st.sidebar.button("📉 Update Library Map"):
     st.success("Library updated!")
     st.rerun()
 
+# --- SIDEBAR EXPLORER ---
 st.sidebar.markdown("---")
 with st.sidebar.expander("📂 File System Explorer", expanded=False):
     root_options = {"Downloads": DOWNLOAD_DIR, "Audiobooks": LIBRARY_DIR}
@@ -432,12 +445,12 @@ with st.sidebar.expander("📂 File System Explorer", expanded=False):
         if files:
             st.markdown("**Files:**")
             for f in files: st.text(f"📄 {f}")
-        if not dirs and not files: st.caption("(Empty Folder)")
     except Exception as e: st.error(f"Access Denied: {e}")
 
-# --- MAIN PAGE ---
-col1, col2 = st.columns([1, 2])
+# --- MAIN LAYOUT (3 Columns) ---
+col1, col2, col3 = st.columns([2, 3, 2])
 
+# --- COL 1: QUEUE ---
 all_items = get_candidates_with_status()
 new_items = [x for x in all_items if x['status_code'] == 0]
 existing_items = [x for x in all_items if x['status_code'] > 0]
@@ -451,75 +464,59 @@ if st.session_state['sync_selection']:
         st.session_state['sync_selection'] = None
 
 with col1:
-    tab_new, tab_exist = st.tabs(["🆕 Untidy Queue", "📚 Already Imported"])
-    
+    tab_new, tab_exist = st.tabs(["🆕 Untidy Queue", "📚 Imported"])
     with tab_new:
         if not new_items:
-            st.info("Nothing new to import!")
+            st.info("Empty.")
         else:
             df_new = pd.DataFrame(new_items)
             sel_new = st.dataframe(
                 df_new[['name']],
-                column_config={"name": st.column_config.TextColumn("Book Name")},
-                use_container_width=True,
-                hide_index=True,
-                height=500,
-                on_select="rerun",
-                selection_mode="single-row",
-                key="grid_new"
+                column_config={"name": st.column_config.TextColumn("Folder Name")},
+                use_container_width=True, hide_index=True, height=600,
+                on_select="rerun", selection_mode="single-row", key="grid_new"
             )
             if sel_new.selection.rows:
                 st.session_state['current_selection_data'] = new_items[sel_new.selection.rows[0]]
 
     with tab_exist:
         if not existing_items:
-            st.info("No imported items found yet.")
+            st.info("Empty.")
         else:
             df_exist = pd.DataFrame(existing_items)
             sel_exist = st.dataframe(
                 df_exist[['State', 'name']],
-                column_config={"State": st.column_config.TextColumn("State", width="small")},
-                use_container_width=True,
-                hide_index=True,
-                height=500,
-                on_select="rerun",
-                selection_mode="single-row",
-                key="grid_exist"
+                column_config={"State": st.column_config.TextColumn("St", width="small")},
+                use_container_width=True, hide_index=True, height=600,
+                on_select="rerun", selection_mode="single-row", key="grid_exist"
             )
             if sel_exist.selection.rows:
                 st.session_state['current_selection_data'] = existing_items[sel_exist.selection.rows[0]]
 
-# Sync 2: List -> Explorer
 selected_item = st.session_state.get('current_selection_data')
 if selected_item:
     if selected_item['path'] != st.session_state.get('last_jumped_path'):
         st.session_state['exp_path'] = os.path.dirname(selected_item['path']) if os.path.isfile(selected_item['path']) else selected_item['path']
         st.session_state['last_jumped_path'] = selected_item['path']
-        if selected_item['path'].startswith(LIBRARY_DIR):
-            st.session_state['exp_root'] = LIBRARY_DIR
-        else:
-            st.session_state['exp_root'] = DOWNLOAD_DIR
+        if selected_item['path'].startswith(LIBRARY_DIR): st.session_state['exp_root'] = LIBRARY_DIR
+        else: st.session_state['exp_root'] = DOWNLOAD_DIR
         st.rerun()
 
+# --- COL 2: EDITOR ---
 with col2:
     if selected_item:
         st.subheader("✏️ Editor")
         st.caption(f"Path: `{selected_item['path']}`")
-        if len(selected_item['file_list']) > 1:
-            st.caption(f"📚 Group contains {len(selected_item['file_list'])} files")
-        
-        if st.button("❌ Close Selection"):
+        if st.button("❌ Close"):
             st.session_state['current_selection_data'] = None
             st.rerun()
             
         c_src, c_bar, c_btn = st.columns([1, 2, 1])
-        with c_src:
-            provider = st.selectbox("Source", ["Audible", "Apple Books", "Google Books"], key='search_provider')
-        with c_bar:
+        with c_src: provider = st.selectbox("Source", ["Apple Books", "Google Books"], key='search_provider', label_visibility="collapsed")
+        with c_bar: 
             clean_q = clean_search_query(selected_item['name'])
             q = st.text_input("Search", value=clean_q, label_visibility="collapsed")
-        with c_btn:
-            do_search = st.button("Search")
+        with c_btn: do_search = st.button("Search")
 
         def update_form_state():
             if 'result_selector' in st.session_state and 'search_results' in st.session_state:
@@ -545,7 +542,7 @@ with col2:
                     first = f"{res[0].get('authors')} - {res[0].get('title')}"
                     st.session_state['result_selector'] = first
                     update_form_state()
-                else: st.warning(f"No matches on {provider}.")
+                else: st.warning(f"No matches.")
 
         if 'search_results' in st.session_state:
             opts = [f"{b.get('authors')} - {b.get('title')}" for b in st.session_state['search_results']]
@@ -561,15 +558,63 @@ with col2:
             year = c2.text_input("Year", key='form_year')
             desc = st.text_area("Desc", key='form_desc')
             img = st.text_input("Cover URL", key='form_img')
-            
             if img: st.image(img, width=100)
             
             lbl = "Make Tidy & Import"
             if selected_item['status_code'] == 1: lbl = "Fix Structure (Move)"
-            
             if st.form_submit_button(lbl, type="primary"):
                 if auth and titl:
                     process_selection(selected_item, auth, titl, seri, part, desc, img, narr, year)
                 else: st.error("Author/Title Required")
     else:
-        st.info("Select a book from the left to edit.")
+        st.info("Select a book from the left.")
+
+# --- COL 3: MANUAL BUILDER ---
+with col3:
+    st.subheader("🛠️ Manual Builder")
+    curr_path = st.session_state['exp_path']
+    st.caption(f"In: `{os.path.basename(curr_path)}`")
+    
+    try:
+        # Get contents of current explorer path
+        all_items = sorted(os.listdir(curr_path))
+        # Filter for relevant items (folders or audio files)
+        valid_items = []
+        for i in all_items:
+            full_p = os.path.join(curr_path, i)
+            if os.path.isdir(full_p) or i.lower().endswith(('.mp3', '.m4b', '.m4a', '.flac')):
+                valid_items.append(i)
+        
+        with st.form("manual_create"):
+            st.write("Select files/folders to bundle as ONE book:")
+            selected_files = st.multiselect("Contents:", valid_items)
+            
+            new_title = st.text_input("Book Title:", value=os.path.basename(curr_path))
+            
+            if st.form_submit_button("✨ Create Book Entry"):
+                if selected_files and new_title:
+                    # Resolve full paths
+                    full_paths = [os.path.join(curr_path, f) for f in selected_files]
+                    
+                    # Create Manual Entry
+                    # We use a special ID to avoid collision
+                    manual_entry = {
+                        "id": f"MANUAL|{time.time()}",
+                        "path": curr_path,
+                        "name": new_title,
+                        "clean": sanitize_for_matching(new_title),
+                        "file_list": full_paths,
+                        "is_group": True,
+                        "is_manual": True
+                    }
+                    
+                    # Add to session state list
+                    st.session_state['manual_books'].insert(0, manual_entry)
+                    st.success("Added to Queue!")
+                    time.sleep(0.5)
+                    st.rerun()
+                else:
+                    st.error("Select files and title.")
+                    
+    except Exception as e:
+        st.error(f"Cannot read path: {e}")
