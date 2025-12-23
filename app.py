@@ -20,6 +20,13 @@ os.makedirs(DATA_DIR, exist_ok=True)
 
 st.set_page_config(page_title="TidyBooks", layout="wide", page_icon="📚")
 
+# --- Initialize Session State for Form ---
+# This ensures the form fields have default values on startup
+default_keys = ['form_auth', 'form_title', 'form_narr', 'form_series', 'form_part', 'form_year', 'form_desc', 'form_img']
+for key in default_keys:
+    if key not in st.session_state:
+        st.session_state[key] = ""
+
 # --- Persistence ---
 def load_json(filepath, default=None):
     if os.path.exists(filepath):
@@ -73,13 +80,13 @@ def scan_library_now():
     return library_items
 
 def get_candidates():
-    # Load history (Fast)
+    # Load history
     history = load_json(HISTORY_FILE, [])
     
-    # Load library cache (Fast - if exists)
+    # Load library cache
     cached_lib = load_json(CACHE_FILE, None)
     if not cached_lib or not isinstance(cached_lib, list):
-        library_items = [] # Empty until user clicks "Update Library"
+        library_items = [] 
     else:
         library_items = cached_lib
     
@@ -127,7 +134,7 @@ def get_candidates():
         
         if full_path in history:
             status = 3
-        elif library_items: # Only check if we have library data
+        elif library_items:
             for lib_item in library_items:
                 clean_lib = lib_item.get('clean')
                 if not clean_lib: continue
@@ -154,7 +161,18 @@ def get_candidates():
             "name": folder_name
         })
 
-    return sorted(final_list, key=lambda x: (1 if x['status'] >= 2 else 0, x['status'] == 2, x['name']))
+    # --- UPDATED SORTING LOGIC ---
+    # Rank 0: Status 0 (New/White) - Appears first
+    # Rank 1: Status 1 (Yellow) - Appears second
+    # Rank 2: Status 2/3 (Green/Done) - Appears last
+    def sort_key(x):
+        s = x['status']
+        rank = 2
+        if s == 0: rank = 0
+        elif s == 1: rank = 1
+        return (rank, x['name'])
+
+    return sorted(final_list, key=sort_key)
 
 def fetch_metadata(query):
     try:
@@ -249,6 +267,11 @@ def process_selection(source_data, author, title, series, series_part, desc, cov
         save_json(HISTORY_FILE, hist)
     
     st.success(f"✅ Done: {clean_title}")
+    
+    # Clear form state for next book
+    for key in default_keys:
+        st.session_state[key] = ""
+        
     time.sleep(1)
     st.rerun()
 
@@ -266,3 +289,80 @@ col1, col2 = st.columns([1, 2])
 
 with col1:
     st.subheader("📂 Untidy Queue")
+    items = get_candidates()
+    if not items:
+        st.info("Queue Empty.")
+        selected_item = None
+    else:
+        label_map = {f"{x['label']}##{i}": x for i, x in enumerate(items)}
+        key = st.radio("Select Book", list(label_map.keys()), format_func=lambda k: label_map[k]['label'].split('##')[0])
+        selected_item = label_map[key]
+
+with col2:
+    if selected_item:
+        st.subheader("✏️ Editor")
+        st.caption(f"Path: `{selected_item['name']}`")
+        
+        clean_q = clean_search_query(selected_item['name'])
+        q = st.text_input("Search", value=clean_q)
+        
+        # --- CALLBACK LOGIC START ---
+        def update_form_state():
+            """Force update session state keys from the search result"""
+            if 'result_selector' in st.session_state and 'search_results' in st.session_state:
+                # Find the object in the results list corresponding to the selected text
+                options = {f"{b.get('authors')} - {b.get('title')}": b for b in st.session_state['search_results']}
+                sel_key = st.session_state['result_selector']
+                if sel_key in options:
+                    data = options[sel_key]
+                    st.session_state['form_auth'] = data.get('authors', '')
+                    st.session_state['form_title'] = data.get('title', '')
+                    st.session_state['form_narr'] = data.get('narrators', '')
+                    st.session_state['form_series'] = data.get('seriesPrimary', '')
+                    st.session_state['form_part'] = data.get('seriesPrimarySequence', '')
+                    rd = data.get('releaseDate')
+                    st.session_state['form_year'] = rd[:4] if rd else ''
+                    st.session_state['form_desc'] = data.get('summary', '')
+                    st.session_state['form_img'] = data.get('image', '')
+
+        if st.button("Search"):
+            with st.spinner("Searching..."):
+                res = fetch_metadata(q)
+                if res:
+                    st.session_state['search_results'] = res
+                    # Pre-select first item
+                    first_opt = f"{res[0].get('authors')} - {res[0].get('title')}"
+                    st.session_state['result_selector'] = first_opt
+                    # Manually trigger the update for the first item
+                    update_form_state()
+                else:
+                    st.warning("No matches found.")
+
+        # If results exist, show dropdown
+        if 'search_results' in st.session_state:
+            opts = [f"{b.get('authors')} - {b.get('title')}" for b in st.session_state['search_results']]
+            if opts:
+                st.selectbox("Results", opts, key='result_selector', on_change=update_form_state)
+        # --- CALLBACK LOGIC END ---
+
+        with st.form("main"):
+            c1, c2 = st.columns(2)
+            # Use keys to bind inputs to session state
+            auth = c1.text_input("Author", key='form_auth')
+            titl = c1.text_input("Title", key='form_title')
+            narr = c1.text_input("Narrator", key='form_narr')
+            seri = c2.text_input("Series", key='form_series')
+            part = c2.text_input("Part #", key='form_part')
+            year = c2.text_input("Year", key='form_year')
+            desc = st.text_area("Desc", key='form_desc')
+            img = st.text_input("Cover URL", key='form_img')
+            
+            if img: st.image(img, width=100)
+            
+            lbl = "Make Tidy & Import"
+            if selected_item['status'] == 1: lbl = "Fix Structure (Move)"
+            
+            if st.form_submit_button(lbl, type="primary"):
+                if auth and titl:
+                    process_selection(selected_item, auth, titl, seri, part, desc, img, narr, year)
+                else: st.error("Author/Title Required")
