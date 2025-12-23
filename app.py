@@ -33,8 +33,8 @@ if 'exp_path' not in st.session_state: st.session_state['exp_path'] = DOWNLOAD_D
 if 'sync_selection' not in st.session_state: st.session_state['sync_selection'] = None
 if 'current_selection_data' not in st.session_state: st.session_state['current_selection_data'] = None
 if 'search_provider' not in st.session_state: st.session_state['search_provider'] = "Apple Books"
+if 'last_jumped_path' not in st.session_state: st.session_state['last_jumped_path'] = None
 if 'manual_books' not in st.session_state: st.session_state['manual_books'] = []
-# Tracks the last book we synced to prevent infinite loops
 if 'last_synced_book_id' not in st.session_state: st.session_state['last_synced_book_id'] = None
 
 # --- Persistence ---
@@ -177,22 +177,23 @@ def get_candidates_with_status():
         status = 0 
         match_path = None
         
+        # Status 3: History (Already Done)
         if unique_id in history or path_str in history:
             status = 3
+        # Status 1: Match Found in Library (Needs Fix/Merge)
         elif library_items:
             for lib_item in library_items:
                 clean_lib = lib_item.get('clean')
                 if not clean_lib: continue
+                # Basic fuzzy match: if clean name is contained in the other
                 if len(clean_lib) > 4 and (clean_lib in clean_dl or clean_dl in clean_lib):
                     match_path = lib_item['path']
-                    if os.path.exists(os.path.join(match_path, "metadata.json")): status = 2
-                    else: status = 1
+                    status = 1
                     break
         
         status_icon = "⚪"
         if status == 3: status_icon = "✅"
-        elif status == 2: status_icon = "✅"
-        elif status == 1: status_icon = "🟡"
+        elif status == 1: status_icon = "⚠️"
         
         display_name = data['name']
         if data.get('is_manual'): display_name = f"🛠️ {display_name}"
@@ -265,25 +266,23 @@ def tag_file(file_path, author, title, series, desc, cover_url, year, track_num,
             audio.save(file_path)
     except: pass
 
-def process_selection(source_data, author, title, series, series_part, desc, cover_url, narrator, publish_year):
+def process_selection(source_data, author, title, series, series_part, desc, cover_url, narrator, publish_year, target_override=None):
     mode = "COPY"
     files_to_process = source_data['file_list']
     
-    if source_data['status_code'] == 1 and source_data['match_path']:
-        mode = "FIX"
-        working_source_path = source_data['match_path']
-        files_to_process = []
-        for root, _, fs in os.walk(working_source_path):
-            for f in fs:
-                if f.lower().endswith(('.mp3', '.m4b', '.m4a', '.flac')):
-                    files_to_process.append(os.path.join(root, f))
-
-    clean_author = sanitize_filename(author)
-    clean_title = sanitize_filename(title)
-    clean_series = sanitize_filename(series)
-    
-    dest_base = os.path.join(LIBRARY_DIR, clean_author, clean_series, clean_title) if clean_series else os.path.join(LIBRARY_DIR, clean_author, clean_title)
-    os.makedirs(dest_base, exist_ok=True)
+    # Check if we are merging/fixing
+    if target_override:
+        mode = "MERGE"
+        dest_base = target_override
+        # Logic: If merging, we don't create new folders based on Author/Title
+        # We assume target_override IS the book folder.
+    else:
+        # Standard Import
+        clean_author = sanitize_filename(author)
+        clean_title = sanitize_filename(title)
+        clean_series = sanitize_filename(series)
+        dest_base = os.path.join(LIBRARY_DIR, clean_author, clean_series, clean_title) if clean_series else os.path.join(LIBRARY_DIR, clean_author, clean_title)
+        os.makedirs(dest_base, exist_ok=True)
 
     files_to_process.sort()
     total = len(files_to_process)
@@ -292,18 +291,27 @@ def process_selection(source_data, author, title, series, series_part, desc, cov
     bar = st.progress(0)
     for i, src in enumerate(files_to_process):
         ext = os.path.splitext(src)[1]
-        name = f"{str(i+1).zfill(pad)} - {clean_title}{ext}" if total > 1 else f"{clean_title}{ext}"
+        name = f"{str(i+1).zfill(pad)} - {sanitize_filename(title)}{ext}"
         dst = os.path.join(dest_base, name)
         
-        if mode == "FIX" and os.path.abspath(src) != os.path.abspath(dst): shutil.move(src, dst)
-        else: shutil.copy2(src, dst)
+        # For MERGE mode, we move/overwrite. For standard, we copy.
+        if mode == "MERGE":
+            shutil.move(src, dst)
+        else:
+            shutil.copy2(src, dst)
+            
         tag_file(dst, author, title, series, desc, cover_url, publish_year, i+1, total)
         bar.progress((i+1)/total)
 
-    if mode == "FIX" and source_data.get('match_path'): 
-        try: shutil.rmtree(source_data['match_path']) 
+    # Cleanup source if we moved everything (Merge Mode)
+    if mode == "MERGE":
+        try:
+            # Only remove if empty
+            if not os.listdir(source_data['path']):
+                shutil.rmtree(source_data['path'])
         except: pass
 
+    # Create Metadata
     abs_meta = {
         "title": title, "authors": [author], "series": [series] if series else [],
         "description": desc, "narrators": [narrator] if narrator else [],
@@ -315,6 +323,7 @@ def process_selection(source_data, author, title, series, series_part, desc, cov
 
     with open(os.path.join(dest_base, "metadata.json"), 'w') as f: json.dump(abs_meta, f, indent=4)
 
+    # History Update
     hist = load_json(HISTORY_FILE, [])
     if source_data['unique_id'] not in hist: hist.append(source_data['unique_id'])
     if source_data['path'] not in hist: hist.append(source_data['path'])
@@ -323,70 +332,59 @@ def process_selection(source_data, author, title, series, series_part, desc, cov
     if source_data.get('is_manual'):
         st.session_state['manual_books'] = [b for b in st.session_state['manual_books'] if b['id'] != source_data['unique_id']]
 
-    st.success(f"✅ Done: {clean_title}")
+    st.success(f"✅ Success: {title}")
     st.cache_data.clear()
     st.session_state['current_selection_data'] = None
     time.sleep(1)
     st.rerun()
 
-# --- MAIN LAYOUT (3 Columns) ---
+# --- MAIN LAYOUT ---
 col1, col2, col3 = st.columns([1.5, 2, 1.5])
 
 # ==================== COLUMN 1: QUEUE ====================
 all_items = get_candidates_with_status()
 new_items = [x for x in all_items if x['status_code'] == 0]
-existing_items = [x for x in all_items if x['status_code'] > 0]
+match_items = [x for x in all_items if x['status_code'] == 1]
+existing_items = [x for x in all_items if x['status_code'] == 3]
 
-# --- SYNC HANDLER: Explorer -> Queue ---
+# Explorer -> Queue Sync
 if st.session_state['sync_selection']:
     sync_target = st.session_state['sync_selection']
     matching = [x for x in all_items if x['path'] == sync_target or sync_target.startswith(x['path'])]
     if matching:
         st.session_state['current_selection_data'] = matching[0]
         st.toast(f"Matched: {matching[0]['name']}")
-        # Clear Sync Target
         st.session_state['sync_selection'] = None
 
 with col1:
-    tab_new, tab_exist = st.tabs(["🆕 Untidy Queue", "📚 Imported"])
+    tab_new, tab_match, tab_exist = st.tabs(["🆕 Untidy", "⚠️ Matches", "📚 Imported"])
     
     with tab_new:
-        if not new_items:
-            st.info("Queue Empty.")
+        if not new_items: st.info("Empty.")
         else:
             df_new = pd.DataFrame(new_items)
-            sel_new = st.dataframe(
-                df_new[['name']],
-                column_config={"name": st.column_config.TextColumn("Book Name")},
-                use_container_width=True, hide_index=True, height=600,
-                on_select="rerun", selection_mode="single-row", key="grid_new"
-            )
-            if sel_new.selection.rows:
-                st.session_state['current_selection_data'] = new_items[sel_new.selection.rows[0]]
+            sel_new = st.dataframe(df_new[['name']], column_config={"name": st.column_config.TextColumn("New Books")}, use_container_width=True, hide_index=True, height=600, on_select="rerun", selection_mode="single-row", key="grid_new")
+            if sel_new.selection.rows: st.session_state['current_selection_data'] = new_items[sel_new.selection.rows[0]]
+
+    with tab_match:
+        if not match_items: st.info("No duplicates found.")
+        else:
+            df_match = pd.DataFrame(match_items)
+            sel_match = st.dataframe(df_match[['name']], column_config={"name": st.column_config.TextColumn("Potential Matches")}, use_container_width=True, hide_index=True, height=600, on_select="rerun", selection_mode="single-row", key="grid_match")
+            if sel_match.selection.rows: st.session_state['current_selection_data'] = match_items[sel_match.selection.rows[0]]
 
     with tab_exist:
-        if not existing_items:
-            st.info("Empty.")
+        if not existing_items: st.info("Empty.")
         else:
             df_exist = pd.DataFrame(existing_items)
-            sel_exist = st.dataframe(
-                df_exist[['State', 'name']],
-                column_config={"State": st.column_config.TextColumn("St", width="small")},
-                use_container_width=True, hide_index=True, height=600,
-                on_select="rerun", selection_mode="single-row", key="grid_exist"
-            )
-            if sel_exist.selection.rows:
-                st.session_state['current_selection_data'] = existing_items[sel_exist.selection.rows[0]]
+            sel_exist = st.dataframe(df_exist[['name']], column_config={"name": st.column_config.TextColumn("Imported History")}, use_container_width=True, hide_index=True, height=600, on_select="rerun", selection_mode="single-row", key="grid_exist")
+            if sel_exist.selection.rows: st.session_state['current_selection_data'] = existing_items[sel_exist.selection.rows[0]]
 
-# --- SYNC HANDLER: Queue -> Explorer ---
+# Queue -> Explorer Sync
 selected_item = st.session_state.get('current_selection_data')
 if selected_item:
-    # Get the target path (Parent folder if file)
     target_path = selected_item['path']
-    if os.path.isfile(target_path):
-        target_path = os.path.dirname(target_path)
-    
-    # If this is a NEW selection, trigger the explorer jump
+    if os.path.isfile(target_path): target_path = os.path.dirname(target_path)
     if st.session_state['last_synced_book_id'] != selected_item['unique_id']:
         st.session_state['exp_path'] = target_path
         st.session_state['last_synced_book_id'] = selected_item['unique_id']
@@ -396,7 +394,19 @@ if selected_item:
 with col2:
     if selected_item:
         st.subheader("✏️ Editor")
-        st.caption(f"Path: `{selected_item['path']}`")
+        
+        # --- MATCH FIXING MODE ---
+        if selected_item['status_code'] == 1:
+            st.warning("⚠️ This book appears to exist in your Library.")
+            st.code(f"Source: {selected_item['path']}", language="text")
+            st.code(f"Target Match: {selected_item['match_path']}", language="text")
+            
+            st.write("Confirming match will **Merge** files and **Fix** metadata.")
+            target_override = selected_item['match_path']
+        else:
+            st.caption(f"Path: `{selected_item['path']}`")
+            target_override = None
+
         if st.button("❌ Close Editor"):
             st.session_state['current_selection_data'] = None
             st.session_state['last_synced_book_id'] = None
@@ -451,11 +461,13 @@ with col2:
             img = st.text_input("Cover URL", key='form_img')
             if img: st.image(img, width=100)
             
-            lbl = "Make Tidy & Import"
-            if selected_item['status_code'] == 1: lbl = "Fix Structure (Move)"
+            # Dynamic Button Label
+            lbl = "🚀 Make Tidy & Import"
+            if target_override: lbl = "✅ Confirm Match & Merge"
+            
             if st.form_submit_button(lbl, type="primary"):
                 if auth and titl:
-                    process_selection(selected_item, auth, titl, seri, part, desc, img, narr, year)
+                    process_selection(selected_item, auth, titl, seri, part, desc, img, narr, year, target_override)
                 else: st.error("Author/Title Required")
     else:
         st.info("👈 Select a book to edit.")
@@ -492,22 +504,18 @@ with col3:
                 on_select="rerun", selection_mode="multi-row"
             )
             
-            # Selection Handling
             selected_rows = sel_files.selection.rows
             
             if selected_rows:
                 selection_data = [file_list[i] for i in selected_rows]
                 st.markdown("---")
                 
-                # Nav Logic
                 if len(selection_data) == 1 and selection_data[0]['type'] == 'dir':
                     if st.button(f"📂 Open '{selection_data[0]['name']}'"):
                         st.session_state['exp_path'] = selection_data[0]['path']
-                        # Trigger Sync to Queue
                         st.session_state['sync_selection'] = selection_data[0]['path']
                         st.rerun()
                         
-                # Manual Bundle Logic
                 with st.form("manual_bundle"):
                     new_name = st.text_input("New Book Title", value=selection_data[0]['name'])
                     if st.form_submit_button("✨ Bundle as Book"):
