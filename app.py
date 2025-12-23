@@ -31,34 +31,6 @@ def load_json(filepath, default=None):
 def save_json(filepath, data):
     with open(filepath, 'w') as f: json.dump(data, f)
 
-# --- Library Scanning ---
-def get_library_map(force_refresh=False):
-    """
-    Scans the library to find all book folders.
-    Returns list of dicts: [{'name': 'Book Title', 'path': '/path/to/Book Title'}]
-    """
-    if not force_refresh:
-        cached = load_json(CACHE_FILE, None)
-        # FIX: Check if cached data is a list. If it's a dict (old format), ignore it.
-        if cached and isinstance(cached, list): 
-            return cached
-            
-    library_items = []
-    # Walk library to find leaf folders (folders that contain files, not just other folders)
-    for root, dirs, files in os.walk(LIBRARY_DIR):
-        has_audio = any(f.lower().endswith(('.mp3', '.m4b', '.m4a', '.flac')) for f in files)
-        
-        if has_audio:
-            folder_name = os.path.basename(root)
-            library_items.append({
-                "name": folder_name,
-                "path": root,
-                "clean": sanitize_for_matching(folder_name)
-            })
-    
-    save_json(CACHE_FILE, library_items)
-    return library_items
-
 # --- Helper Functions ---
 def sanitize_for_matching(text):
     if not text: return ""
@@ -84,12 +56,34 @@ def clean_search_query(text):
     text = text.replace('.', ' ').replace('_', ' ').replace('-', ' ')
     return re.sub(r'\s+', ' ', text).strip()
 
-def get_candidates(force_refresh=False):
+# --- Library Scanning (Lazy Load) ---
+def scan_library_now():
+    """Manual trigger to scan library and save to cache."""
+    library_items = []
+    for root, dirs, files in os.walk(LIBRARY_DIR):
+        has_audio = any(f.lower().endswith(('.mp3', '.m4b', '.m4a', '.flac')) for f in files)
+        if has_audio:
+            folder_name = os.path.basename(root)
+            library_items.append({
+                "name": folder_name,
+                "path": root,
+                "clean": sanitize_for_matching(folder_name)
+            })
+    save_json(CACHE_FILE, library_items)
+    return library_items
+
+def get_candidates():
+    # Load history (Fast)
     history = load_json(HISTORY_FILE, [])
-    library_items = get_library_map(force_refresh)
     
-    if not os.path.exists(DOWNLOAD_DIR):
-        return []
+    # Load library cache (Fast - if exists)
+    cached_lib = load_json(CACHE_FILE, None)
+    if not cached_lib or not isinstance(cached_lib, list):
+        library_items = [] # Empty until user clicks "Update Library"
+    else:
+        library_items = cached_lib
+    
+    if not os.path.exists(DOWNLOAD_DIR): return []
 
     candidate_map = {} 
 
@@ -100,6 +94,7 @@ def get_candidates(force_refresh=False):
             folder_name = os.path.basename(root)
             if is_junk_folder(folder_name): continue
 
+            # Skip subfolders unless they are hidden
             has_real_subfolders = any(not d.startswith('.') for d in dirs)
             if has_real_subfolders: continue
 
@@ -107,6 +102,7 @@ def get_candidates(force_refresh=False):
             target_name = folder_name
             parent_path = os.path.dirname(root)
             
+            # Bubble up CD/Part folders
             if re.match(r'^(cd|disc|part|vol|chapter)?\s*\d+$', folder_name, re.IGNORECASE):
                  if os.path.abspath(parent_path) != os.path.abspath(DOWNLOAD_DIR):
                      target_path = parent_path
@@ -131,9 +127,9 @@ def get_candidates(force_refresh=False):
         
         if full_path in history:
             status = 3
-        else:
+        elif library_items: # Only check if we have library data
             for lib_item in library_items:
-                clean_lib = lib_item['clean']
+                clean_lib = lib_item.get('clean')
                 if not clean_lib: continue
                 
                 if len(clean_lib) > 4 and (clean_lib in clean_dl or clean_dl in clean_lib):
@@ -172,4 +168,145 @@ def fetch_metadata(query):
 def tag_file(file_path, author, title, series, desc, cover_url, year, track_num, total_tracks):
     ext = os.path.splitext(file_path)[1].lower()
     try:
-        if ext in ['.m4b', '.m4
+        if ext in ['.m4b', '.m4a']:
+            audio = MP4(file_path)
+            if audio.tags is None: audio.add_tags()
+            audio.tags['\xa9nam'] = title; audio.tags['\xa9ART'] = author
+            audio.tags['\xa9alb'] = series if series else title; audio.tags['desc'] = desc
+            audio.tags['trkn'] = [(track_num, total_tracks)]
+            if year: audio.tags['\xa9day'] = year
+            if cover_url:
+                audio.tags['covr'] = [MP4Cover(requests.get(cover_url).content, imageformat=MP4Cover.FORMAT_JPEG)]
+            audio.save()
+        elif ext == '.mp3':
+            try: audio = ID3(file_path) 
+            except: audio = ID3()
+            audio.add(TIT2(encoding=3, text=title)); audio.add(TPE1(encoding=3, text=author))
+            audio.add(TALB(encoding=3, text=series if series else title))
+            audio.add(TRCK(encoding=3, text=f"{track_num}/{total_tracks}"))
+            if desc: audio.add(COMM(encoding=3, lang='eng', desc='Description', text=desc))
+            if cover_url:
+                audio.add(APIC(3, 'image/jpeg', 3, 'Front Cover', requests.get(cover_url).content))
+            audio.save(file_path)
+    except: pass
+
+def process_selection(source_data, author, title, series, series_part, desc, cover_url, narrator, publish_year):
+    mode = "COPY"
+    working_source_path = source_data['path']
+    if source_data['status'] == 1 and source_data['match_path']:
+        mode = "FIX"
+        working_source_path = source_data['match_path']
+
+    clean_author = sanitize_filename(author, True)
+    clean_title = sanitize_filename(title, True)
+    clean_series = sanitize_filename(series, False)
+    
+    dest_base = os.path.join(LIBRARY_DIR, clean_author, clean_series, clean_title) if clean_series else os.path.join(LIBRARY_DIR, clean_author, clean_title)
+    os.makedirs(dest_base, exist_ok=True)
+
+    files = []
+    for root, _, fs in os.walk(working_source_path):
+        for f in fs:
+            if f.lower().endswith(('.mp3', '.m4b', '.m4a', '.flac')):
+                files.append(os.path.join(root, f))
+    files.sort()
+    
+    total = len(files)
+    pad = max(2, len(str(total)))
+    
+    bar = st.progress(0)
+    
+    for i, src in enumerate(files):
+        ext = os.path.splitext(src)[1]
+        name = f"{str(i+1).zfill(pad)} - {clean_title}{ext}" if total > 1 else f"{clean_title}{ext}"
+        dst = os.path.join(dest_base, name)
+        
+        if mode == "FIX" and os.path.abspath(src) != os.path.abspath(dst): shutil.move(src, dst)
+        else: shutil.copy2(src, dst)
+        
+        tag_file(dst, author, title, series, desc, cover_url, publish_year, i+1, total)
+        bar.progress((i+1)/total)
+
+    if mode == "FIX": 
+        try: shutil.rmtree(working_source_path) 
+        except: pass
+
+    abs_meta = {
+        "title": title, "authors": [author], "series": [series] if series else [],
+        "description": desc, "narrators": [narrator] if narrator else [],
+        "publishYear": publish_year, "cover": cover_url
+    }
+    if series and series_part:
+        try: abs_meta["series"] = [{"sequence": series_part, "name": series}]
+        except: abs_meta["series"] = [series]
+
+    with open(os.path.join(dest_base, "metadata.json"), 'w') as f: json.dump(abs_meta, f, indent=4)
+
+    # History & Cache Update
+    hist = load_json(HISTORY_FILE, [])
+    if source_data['path'] not in hist:
+        hist.append(source_data['path'])
+        save_json(HISTORY_FILE, hist)
+    
+    st.success(f"✅ Done: {clean_title}")
+    time.sleep(1)
+    st.rerun()
+
+# --- MAIN UI ---
+st.sidebar.title("🛠️ Tools")
+
+# Manual Scan Trigger
+if st.sidebar.button("📉 Update Library Map"):
+    with st.spinner("Scanning library..."):
+        scan_library_now()
+    st.success("Library updated!")
+    st.rerun()
+
+col1, col2 = st.columns([1, 2])
+
+with col1:
+    st.subheader("📂 Untidy Queue")
+    items = get_candidates()
+    if not items:
+        st.info("Queue Empty.")
+        selected_item = None
+    else:
+        label_map = {f"{x['label']}##{i}": x for i, x in enumerate(items)}
+        key = st.radio("Select Book", list(label_map.keys()), format_func=lambda k: label_map[k]['label'].split('##')[0])
+        selected_item = label_map[key]
+
+with col2:
+    if selected_item:
+        st.subheader("✏️ Editor")
+        st.caption(f"Path: `{selected_item['name']}`")
+        
+        clean_q = clean_search_query(selected_item['name'])
+        q = st.text_input("Search", value=clean_q)
+        if st.button("Search"):
+            res = fetch_metadata(q)
+            if res: st.session_state['res'] = res
+            
+        found = {}
+        if 'res' in st.session_state:
+            opts = {f"{b.get('authors')} - {b.get('title')}": b for b in st.session_state['res']}
+            sel = st.selectbox("Results", opts.keys())
+            if sel: found = opts[sel]
+
+        with st.form("main"):
+            c1, c2 = st.columns(2)
+            auth = c1.text_input("Author", found.get('authors',''))
+            titl = c1.text_input("Title", found.get('title',''))
+            narr = c1.text_input("Narrator", found.get('narrators',''))
+            seri = c2.text_input("Series", found.get('seriesPrimary',''))
+            part = c2.text_input("Part #", found.get('seriesPrimarySequence',''))
+            year = c2.text_input("Year", found.get('releaseDate','')[:4] if found.get('releaseDate') else '')
+            desc = st.text_area("Desc", found.get('summary',''))
+            img = st.text_input("Cover URL", found.get('image',''))
+            if img: st.image(img, width=100)
+            
+            lbl = "Make Tidy & Import"
+            if selected_item['status'] == 1: lbl = "Fix Structure (Move)"
+            if st.form_submit_button(lbl, type="primary"):
+                if auth and titl:
+                    process_selection(selected_item, auth, titl, seri, part, desc, img, narr, year)
+                else: st.error("Author/Title Required")
