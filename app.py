@@ -8,6 +8,7 @@ import re
 import time
 from mutagen.mp4 import MP4, MP4Cover
 from mutagen.id3 import ID3, TIT2, TPE1, TALB, APIC, COMM, TRCK
+import difflib
 
 # --- Configuration ---
 DOWNLOAD_DIR = "/downloads"
@@ -53,6 +54,7 @@ def sanitize_for_matching(text):
     if not text: return ""
     text = text.lower()
     text = re.sub(r'\b(audiobook|mp3|m4b|cd|disc|part|v|vol|chapter)\b', '', text)
+    # FIX: Allow 0-9 so numbered books match correctly
     text = re.sub(r'[^a-z0-9]', '', text) 
     return text
 
@@ -113,8 +115,12 @@ def scan_downloads_snapshot():
             folder_name = os.path.basename(root)
             if is_junk_folder(folder_name): continue
             
-            # 1. Collection Logic
-            if "collection" in folder_name.lower():
+            # CHECK: Is this the Root Folder?
+            is_root = os.path.abspath(root) == os.path.abspath(DOWNLOAD_DIR)
+
+            # 1. Collection/Root Logic (Group by File Name)
+            # We use this logic if the folder is named "Collection" OR if we are in the Root
+            if "collection" in folder_name.lower() or is_root:
                 groups = {}
                 for f in audio_files:
                     stem = get_file_stem(f)
@@ -124,15 +130,19 @@ def scan_downloads_snapshot():
                 
                 for stem, file_list in groups.items():
                     unique_id = f"{root}|{stem}"
+                    # Use stem as name for root files, otherwise folder name logic
                     display_name = stem.title()
+                    
                     full_paths = [os.path.join(root, f) for f in file_list]
                     candidates.append({
                         "id": unique_id, "path": root, "name": display_name,
                         "clean": sanitize_for_matching(display_name),
                         "file_list": full_paths, "is_group": True 
                     })
-            # 2. Standard Logic
+            
+            # 2. Standard Logic (One Folder = One Book)
             else:
+                # Skip parent folders if they have valid subfolders
                 has_real_subfolders = any(not d.startswith('.') for d in dirs)
                 if has_real_subfolders: continue 
 
@@ -140,6 +150,7 @@ def scan_downloads_snapshot():
                 target_name = folder_name
                 parent_path = os.path.dirname(root)
                 
+                # Bubble up "CD 1" folders
                 if re.match(r'^(cd|disc|part|vol|chapter)?\s*\d+$', folder_name, re.IGNORECASE):
                      if os.path.abspath(parent_path) != os.path.abspath(DOWNLOAD_DIR):
                          target_path = parent_path
@@ -157,17 +168,9 @@ def scan_downloads_snapshot():
                     })
     return candidates
 
-def get_candidates_with_status():
-    raw_candidates = scan_downloads_snapshot()
-    manual_items = st.session_state.get('manual_books', [])
-    all_candidates = manual_items + raw_candidates
-    
-    history = load_json(HISTORY_FILE, [])
-    
-    cached_lib = load_json(CACHE_FILE, [])
-    if not cached_lib: cached_lib = scan_library_now()
-    library_items = cached_lib
-    
+# --- PERFORMANCE FIX: CACHED MATCHER ---
+@st.cache_data(show_spinner=False)
+def calculate_matches(all_candidates, library_items, history):
     final_list = []
     
     for data in all_candidates:
@@ -208,7 +211,37 @@ def get_candidates_with_status():
 
     return sorted(final_list, key=lambda x: (x['status_code'] > 0, natural_keys(x['raw_name'])))
 
-# --- SEARCH ---
+def get_candidates_with_status():
+    raw_candidates = scan_downloads_snapshot()
+    manual_items = st.session_state.get('manual_books', [])
+    all_candidates = manual_items + raw_candidates
+    
+    history = load_json(HISTORY_FILE, [])
+    cached_lib = load_json(CACHE_FILE, [])
+    if not cached_lib: cached_lib = scan_library_now()
+    
+    return calculate_matches(all_candidates, cached_lib, history)
+
+# --- SEARCH & SCRAPING ---
+def extract_details_smart(title, desc):
+    narrator = ""
+    series = ""
+    part = ""
+    
+    # Narrator Regex
+    narr_pat = r"(?:narrated|read)\s+by\s+([A-Za-z\s\.]+?)(?:[\.,\n\(-]|$)"
+    match_narr = re.search(narr_pat, desc, re.IGNORECASE)
+    if match_narr: narrator = match_narr.group(1).strip()
+
+    # Series Regex
+    series_pat_a = r"\(([^)]+?),\s*(?:Book|Vol|Part)\s*(\d+)\)"
+    match_series_a = re.search(series_pat_a, title, re.IGNORECASE)
+    if match_series_a:
+        series = match_series_a.group(1).strip()
+        part = match_series_a.group(2).strip()
+
+    return narrator, series, part
+
 def fetch_metadata(query, provider):
     results = []
     try:
@@ -217,10 +250,14 @@ def fetch_metadata(query, provider):
             if r.status_code == 200:
                 for item in r.json().get('results', []):
                     img = item.get('artworkUrl100', '').replace('100x100', '600x600')
+                    raw_title = item.get('collectionName', '')
+                    raw_desc = item.get('description', '')
+                    s_narr, s_ser, s_part = extract_details_smart(raw_title, raw_desc)
+                    
                     results.append({
-                        "title": item.get('collectionName'), "authors": item.get('artistName'),
-                        "narrators": "", "series": "", "part": "", "summary": item.get('description', ''),
-                        "image": img, "releaseDate": item.get('releaseDate', '')
+                        "title": raw_title, "authors": item.get('artistName', ''),
+                        "narrators": s_narr, "series": s_ser, "part": s_part, 
+                        "summary": raw_desc, "image": img, "releaseDate": item.get('releaseDate', '')
                     })
         else: # Google
             r = requests.get(GOOGLE_BOOKS_API, params={"q": query, "maxResults": 10, "langRestrict": "en"}, timeout=5)
@@ -229,11 +266,14 @@ def fetch_metadata(query, provider):
                     info = item.get('volumeInfo', {})
                     img = info.get('imageLinks', {}).get('thumbnail', '').replace('http:', 'https:')
                     auths = info.get('authors', [])
+                    raw_title = info.get('title', '')
+                    raw_desc = info.get('description', '')
+                    s_narr, s_ser, s_part = extract_details_smart(raw_title, raw_desc)
+
                     results.append({
-                        "title": info.get('title'), "authors": auths[0] if auths else "",
-                        "narrators": ", ".join(auths[1:]) if len(auths)>1 else "",
-                        "series": "", "part": "", "summary": info.get('description', ''),
-                        "image": img, "releaseDate": info.get('publishedDate', '')
+                        "title": raw_title, "authors": auths[0] if auths else "",
+                        "narrators": s_narr, "series": s_ser, "part": s_part, 
+                        "summary": raw_desc, "image": img, "releaseDate": info.get('publishedDate', '')
                     })
     except: pass
     return results
@@ -273,24 +313,20 @@ def tag_file(file_path, author, title, series, desc, cover_url, year, track_num,
 def process_selection(source_data, author, title, series, series_part, desc, cover_url, narrator, publish_year, target_override=None):
     files_to_process = source_data['file_list']
     
-    # --- MERGE/FIX MODE LOGIC ---
+    # --- MERGE/FIX MODE ---
     if target_override:
         dest_base = target_override
-        # NEW: Clean the destination folder first to prevent double copies.
-        # We wipe it so we can replace the "messy" version with the "clean" version.
+        # Wipe destination for clean merge
         try:
-            # We iterate and delete contents, preserving the folder itself
             for filename in os.listdir(dest_base):
                 file_path = os.path.join(dest_base, filename)
                 if os.path.isfile(file_path) or os.path.islink(file_path):
                     os.unlink(file_path)
                 elif os.path.isdir(file_path):
                     shutil.rmtree(file_path)
-        except Exception as e:
-            st.error(f"Error cleaning destination: {e}")
-            return # Stop to be safe
+        except: pass
     else:
-        # Standard Import (New Folder)
+        # Standard Import
         clean_author = sanitize_filename(author)
         clean_title = sanitize_filename(title)
         clean_series = sanitize_filename(series)
@@ -307,8 +343,7 @@ def process_selection(source_data, author, title, series, series_part, desc, cov
         name = f"{str(i+1).zfill(pad)} - {sanitize_filename(title)}{ext}"
         dst = os.path.join(dest_base, name)
         
-        # --- CRITICAL: ALWAYS COPY (NEVER MOVE) ---
-        # Because source is Read-Only torrent folder
+        # COPY (Never Move)
         shutil.copy2(src, dst)
             
         tag_file(dst, author, title, series, desc, cover_url, publish_year, i+1, total)
@@ -350,7 +385,7 @@ new_items = [x for x in all_items if x['status_code'] == 0]
 match_items = [x for x in all_items if x['status_code'] == 1]
 existing_items = [x for x in all_items if x['status_code'] == 3]
 
-# Explorer -> Queue Sync
+# Sync: Explorer -> Queue
 if st.session_state['sync_selection']:
     sync_target = st.session_state['sync_selection']
     matching = [x for x in all_items if x['path'] == sync_target or sync_target.startswith(x['path'])]
@@ -383,7 +418,7 @@ with col1:
             sel_exist = st.dataframe(df_exist[['name']], column_config={"name": st.column_config.TextColumn("Imported History")}, use_container_width=True, hide_index=True, height=600, on_select="rerun", selection_mode="single-row", key="grid_exist")
             if sel_exist.selection.rows: st.session_state['current_selection_data'] = existing_items[sel_exist.selection.rows[0]]
 
-# Queue -> Explorer Sync
+# Sync: Queue -> Explorer
 selected_item = st.session_state.get('current_selection_data')
 if selected_item:
     target_path = selected_item['path']
@@ -403,7 +438,6 @@ with col2:
             st.warning("⚠️ This book appears to exist in your Library.")
             st.code(f"Source: {selected_item['path']}", language="text")
             st.code(f"Target Match: {selected_item['match_path']}", language="text")
-            
             st.write("Confirming match will **Merge** files and **Fix** metadata.")
             target_override = selected_item['match_path']
         else:
@@ -464,7 +498,6 @@ with col2:
             img = st.text_input("Cover URL", key='form_img')
             if img: st.image(img, width=100)
             
-            # Dynamic Button Label
             lbl = "🚀 Make Tidy & Import"
             if target_override: lbl = "✅ Confirm Match & Merge"
             
@@ -499,7 +532,6 @@ with col3:
         
         if file_list:
             df_files = pd.DataFrame(file_list)
-            
             sel_files = st.dataframe(
                 df_files[['icon', 'name']],
                 column_config={"icon": st.column_config.TextColumn("", width="small")},
