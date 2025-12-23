@@ -1,19 +1,16 @@
 version: '3.8'
 services:
-  tidybooks:  # Service Name Changed
+  tidybooks:  
     build: .
-    container_name: tidybooks  # Container Name Changed
+    container_name: tidybooks  
     ports:
       - "8502:8501"
+    network_mode: host    
     volumes:
-      # Remember to verify your Synology paths on the left
       - /volume1/Zack/media/downloads/Audiobooks - MAM - Seeding:/downloads:ro
       - /volume1/Zack/media/audiobooks:/audiobooks:rw
       - /volume2/docker/tidybooks:/app/data
     environment:
       - PUID=0
       - PGID=0
-    dns:
-      - 8.8.8.8
-      - 1.1.1.1
     restart: unless-stopped
