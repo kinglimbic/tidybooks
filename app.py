@@ -217,11 +217,9 @@ def get_candidates_with_status():
 # --- SEARCH ---
 def extract_details_smart(title, desc, subtitle=""):
     narrator, series, part = "", "", ""
-    # Safe handling of None
     title = title or ""
     desc = desc or ""
     subtitle = subtitle or ""
-    
     full_text = f"{title} {subtitle} {desc}"
     
     narr_pat = r"(?:narrated|read)\s+by\s+([A-Za-z\s\.]+?)(?:[\.,\n\(-]|$)"
@@ -247,10 +245,12 @@ def extract_details_smart(title, desc, subtitle=""):
 
 def fetch_audnexus_direct(asin):
     if not asin: return []
+    # Try different headers
     headers_list = [
         {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/91.0.4472.124 Safari/537.36'},
         {'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/14.0 Safari/605.1.15'}
     ]
+    
     for headers in headers_list:
         try:
             r = requests.get(f"{AUDNEXUS_API}/{asin}", headers=headers, timeout=10)
@@ -267,7 +267,10 @@ def fetch_audnexus_direct(asin):
                     "releaseDate": b.get('releaseDate') or "",
                     "source": f"Audible ({asin})"
                 }]
-        except: pass
+            else:
+                st.toast(f"Audnexus Error: {r.status_code}")
+        except Exception as e:
+            st.toast(f"Connection Failed: {e}")
     return []
 
 def fetch_itunes(query):
@@ -312,11 +315,6 @@ def fetch_google(query):
     except: pass
     return []
 
-def fetch_metadata_router(query, provider, asin=None):
-    if asin: return fetch_audnexus_direct(asin)
-    if provider == "Apple Books": return fetch_itunes(query)
-    return fetch_google(query)
-
 # --- PROCESSING ---
 def tag_file(file_path, author, title, series, desc, cover_url, year, track_num, total_tracks):
     ext = os.path.splitext(file_path)[1].lower()
@@ -357,7 +355,7 @@ def process_selection(source_data, author, title, series, series_part, desc, cov
                 elif os.path.isdir(file_path): shutil.rmtree(file_path)
         except Exception as e:
             st.error(f"Error cleaning destination: {e}")
-            return # Stop to be safe
+            return
     else:
         clean_author = sanitize_filename(author)
         clean_title = sanitize_filename(title)
@@ -374,10 +372,7 @@ def process_selection(source_data, author, title, series, series_part, desc, cov
         ext = os.path.splitext(src)[1]
         name = f"{str(i+1).zfill(pad)} - {sanitize_filename(title)}{ext}"
         dst = os.path.join(dest_base, name)
-        
-        # ALWAYS COPY, NEVER MOVE
         shutil.copy2(src, dst)
-            
         tag_file(dst, author, title, series, desc, cover_url, publish_year, i+1, total)
         bar.progress((i+1)/total)
 
@@ -416,7 +411,7 @@ match_items = [x for x in auto_processed if x['status_code'] == 1]
 existing_items = [x for x in auto_processed if x['status_code'] == 3]
 built_items = [x for x in manual_processed]
 
-# Sync: Explorer -> Queue
+# Sync
 if st.session_state['sync_selection']:
     sync_target = st.session_state['sync_selection']
     all_known = auto_processed + manual_processed
@@ -434,7 +429,7 @@ if st.session_state['sync_selection']:
         st.toast(f"Matched: {matching[0]['name']}")
         st.session_state['sync_selection'] = None
 
-# --- COL 1: QUEUE ---
+# --- COL 1 ---
 with col1:
     tab_new, tab_built, tab_match, tab_exist = st.tabs(["🆕 Untidy", "🛠️ Built", "⚠️ Match", "📚 Done"])
     
@@ -532,13 +527,22 @@ with col2:
             st.rerun()
             
         clean_q = clean_search_query(selected_item['name'])
-        q = st.text_input("Search", value=clean_q)
+        q_text = st.text_input("Title Search", value=clean_q)
         
-        c_p, c_a = st.columns([1, 2])
-        with c_p: provider = st.selectbox("Source", ["Apple Books", "Google Books"])
-        with c_a: asin_input = st.text_input("Or Audible ASIN", placeholder="e.g. B01N...")
-        
-        do_search = st.button("Search")
+        c_p, c_btn = st.columns([2, 1])
+        with c_p: provider = st.selectbox("Provider", ["Apple Books", "Google Books"])
+        with c_btn: 
+            st.write("")
+            do_text_search = st.button("🔍 Search Text")
+
+        st.markdown("---")
+        # ASIN Search
+        c_asin, c_abtn = st.columns([2, 1])
+        with c_asin:
+            asin_val = st.text_input("Audible ASIN (ID)", placeholder="B0...")
+        with c_abtn:
+            st.write("")
+            do_asin_search = st.button("🆔 Lookup ID")
 
         # Function to force update session state from results
         def force_update_form(idx):
@@ -556,28 +560,30 @@ with col2:
                     st.session_state['form_img'] = data.get('image') or ''
                 except: pass
 
-        if do_search or asin_input:
-            with st.spinner(f"Searching..."):
-                if asin_input:
-                    res = fetch_metadata_router(q, "Audible", asin_input.strip())
-                else:
-                    res = fetch_metadata_router(q, provider)
-                
+        # Logic Split
+        if do_asin_search and asin_val:
+             with st.spinner(f"Fetching ASIN..."):
+                res = fetch_metadata_router(None, "Audible", asin_val.strip())
                 if res:
                     st.session_state['search_results'] = res
-                    # Auto-select first result
                     force_update_form(0)
-                else: st.warning(f"No matches.")
+                else: st.warning(f"ASIN Not Found.")
+        
+        elif do_text_search:
+             with st.spinner(f"Searching {provider}..."):
+                res = fetch_metadata_router(q_text, provider)
+                if res:
+                    st.session_state['search_results'] = res
+                    force_update_form(0)
+                else: st.warning(f"No text matches.")
 
         if 'search_results' in st.session_state:
             opts = [f"{b.get('authors')} - {b.get('title')}" for b in st.session_state['search_results']]
-            # Use Index to drive selection to avoid text key errors
             sel_idx = st.selectbox("Results", range(len(opts)), format_func=lambda x: opts[x])
-            # Force update on selection change
             force_update_form(sel_idx)
 
         # Raw Data Inspector (Debug)
-        with st.expander("🔍 Show Raw Data (Debug)"):
+        with st.expander("🔍 Show Raw Data"):
             if 'search_results' in st.session_state:
                 st.json(st.session_state['search_results'])
 
