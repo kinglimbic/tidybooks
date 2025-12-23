@@ -18,6 +18,7 @@ HISTORY_FILE = os.path.join(DATA_DIR, "processed_log.json")
 CACHE_FILE = os.path.join(DATA_DIR, "library_map_cache.json")
 
 # API ENDPOINTS
+AUDNEXUS_API = "https://api.audnexus.com/books"
 ITUNES_API = "https://itunes.apple.com/search"
 GOOGLE_BOOKS_API = "https://www.googleapis.com/books/v1/volumes"
 
@@ -33,10 +34,16 @@ for key in default_keys:
 if 'exp_path' not in st.session_state: st.session_state['exp_path'] = DOWNLOAD_DIR
 if 'sync_selection' not in st.session_state: st.session_state['sync_selection'] = None
 if 'current_selection_data' not in st.session_state: st.session_state['current_selection_data'] = None
-if 'search_provider' not in st.session_state: st.session_state['search_provider'] = "Apple Books"
+if 'search_provider' not in st.session_state: st.session_state['search_provider'] = "Audible"
 if 'last_jumped_path' not in st.session_state: st.session_state['last_jumped_path'] = None
 if 'manual_books' not in st.session_state: st.session_state['manual_books'] = []
 if 'last_synced_book_id' not in st.session_state: st.session_state['last_synced_book_id'] = None
+
+# Grid Keys (Used to force-deselect other grids)
+if 'grid_key_auto' not in st.session_state: st.session_state['grid_key_auto'] = 0
+if 'grid_key_manual' not in st.session_state: st.session_state['grid_key_manual'] = 0
+if 'grid_key_match' not in st.session_state: st.session_state['grid_key_match'] = 0
+if 'grid_key_done' not in st.session_state: st.session_state['grid_key_done'] = 0
 
 # --- Persistence ---
 def load_json(filepath, default=None):
@@ -54,7 +61,6 @@ def sanitize_for_matching(text):
     if not text: return ""
     text = text.lower()
     text = re.sub(r'\b(audiobook|mp3|m4b|cd|disc|part|v|vol|chapter)\b', '', text)
-    # FIX: Allow 0-9 so numbered books match correctly
     text = re.sub(r'[^a-z0-9]', '', text) 
     return text
 
@@ -115,11 +121,9 @@ def scan_downloads_snapshot():
             folder_name = os.path.basename(root)
             if is_junk_folder(folder_name): continue
             
-            # CHECK: Is this the Root Folder?
             is_root = os.path.abspath(root) == os.path.abspath(DOWNLOAD_DIR)
 
-            # 1. Collection/Root Logic (Group by File Name)
-            # We use this logic if the folder is named "Collection" OR if we are in the Root
+            # 1. Collection/Root Logic
             if "collection" in folder_name.lower() or is_root:
                 groups = {}
                 for f in audio_files:
@@ -130,19 +134,15 @@ def scan_downloads_snapshot():
                 
                 for stem, file_list in groups.items():
                     unique_id = f"{root}|{stem}"
-                    # Use stem as name for root files, otherwise folder name logic
                     display_name = stem.title()
-                    
                     full_paths = [os.path.join(root, f) for f in file_list]
                     candidates.append({
                         "id": unique_id, "path": root, "name": display_name,
                         "clean": sanitize_for_matching(display_name),
                         "file_list": full_paths, "is_group": True 
                     })
-            
-            # 2. Standard Logic (One Folder = One Book)
+            # 2. Standard Logic
             else:
-                # Skip parent folders if they have valid subfolders
                 has_real_subfolders = any(not d.startswith('.') for d in dirs)
                 if has_real_subfolders: continue 
 
@@ -150,7 +150,6 @@ def scan_downloads_snapshot():
                 target_name = folder_name
                 parent_path = os.path.dirname(root)
                 
-                # Bubble up "CD 1" folders
                 if re.match(r'^(cd|disc|part|vol|chapter)?\s*\d+$', folder_name, re.IGNORECASE):
                      if os.path.abspath(parent_path) != os.path.abspath(DOWNLOAD_DIR):
                          target_path = parent_path
@@ -168,11 +167,9 @@ def scan_downloads_snapshot():
                     })
     return candidates
 
-# --- PERFORMANCE FIX: CACHED MATCHER ---
 @st.cache_data(show_spinner=False)
 def calculate_matches(all_candidates, library_items, history):
     final_list = []
-    
     for data in all_candidates:
         unique_id = data['id']
         path_str = data['path']
@@ -180,15 +177,11 @@ def calculate_matches(all_candidates, library_items, history):
         status = 0 
         match_path = None
         
-        # Status 3: History
-        if unique_id in history or path_str in history:
-            status = 3
-        # Status 1: Match Found in Library
+        if unique_id in history or path_str in history: status = 3
         elif library_items:
             for lib_item in library_items:
                 clean_lib = lib_item.get('clean')
                 if not clean_lib: continue
-                # Match logic: allow numbers, length > 2
                 if len(clean_lib) > 2 and (clean_lib in clean_dl or clean_dl in clean_lib):
                     match_path = lib_item['path']
                     status = 1
@@ -208,79 +201,113 @@ def calculate_matches(all_candidates, library_items, history):
             "match_path": match_path, "file_list": data['file_list'],
             "is_manual": data.get('is_manual', False)
         })
-
     return sorted(final_list, key=lambda x: (x['status_code'] > 0, natural_keys(x['raw_name'])))
 
 def get_candidates_with_status():
     raw_candidates = scan_downloads_snapshot()
     manual_items = st.session_state.get('manual_books', [])
-    all_candidates = manual_items + raw_candidates
+    # Process both lists independently so we can separate them in tabs
     
     history = load_json(HISTORY_FILE, [])
     cached_lib = load_json(CACHE_FILE, [])
     if not cached_lib: cached_lib = scan_library_now()
     
-    return calculate_matches(all_candidates, cached_lib, history)
-
-# --- SEARCH & SCRAPING ---
-def extract_details_smart(title, desc):
-    narrator = ""
-    series = ""
-    part = ""
+    auto_processed = calculate_matches(raw_candidates, cached_lib, history)
+    manual_processed = calculate_matches(manual_items, cached_lib, history)
     
-    # Narrator Regex
+    return auto_processed, manual_processed
+
+# --- SEARCH ---
+def extract_details_smart(title, desc, subtitle=""):
+    narrator, series, part = "", "", ""
+    full_text = f"{title} {subtitle} {desc}"
+    
     narr_pat = r"(?:narrated|read)\s+by\s+([A-Za-z\s\.]+?)(?:[\.,\n\(-]|$)"
-    match_narr = re.search(narr_pat, desc, re.IGNORECASE)
+    match_narr = re.search(narr_pat, full_text, re.IGNORECASE)
     if match_narr: narrator = match_narr.group(1).strip()
 
-    # Series Regex
-    series_pat_a = r"\(([^)]+?),\s*(?:Book|Vol|Part)\s*(\d+)\)"
-    match_series_a = re.search(series_pat_a, title, re.IGNORECASE)
-    if match_series_a:
-        series = match_series_a.group(1).strip()
-        part = match_series_a.group(2).strip()
+    if ":" in title:
+        split_title = title.split(":")
+        if len(split_title[0]) > 3: 
+            series = split_title[0].strip()
+            part_pat = r"(?:Book|Vol|Part)\s*(\d+)"
+            match_part = re.search(part_pat, full_text, re.IGNORECASE)
+            if match_part: part = match_part.group(1)
 
+    series_pat_b = r"\(([^)]+?)(?:,|#|;)\s*(?:Book|Vol|Part)?\s*(\d+)\)"
+    match_series_b = re.search(series_pat_b, title, re.IGNORECASE)
+    if match_series_b:
+        series = match_series_b.group(1).strip()
+        part = match_series_b.group(2).strip()
     return narrator, series, part
 
-def fetch_metadata(query, provider):
-    results = []
+def fetch_audnexus(query):
+    # Added Real Browser Headers to bypass potential blocks
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+    }
     try:
-        if provider == "Apple Books":
-            r = requests.get(ITUNES_API, params={'term': query, 'media': 'audiobook', 'limit': 10}, timeout=5)
-            if r.status_code == 200:
-                for item in r.json().get('results', []):
-                    img = item.get('artworkUrl100', '').replace('100x100', '600x600')
-                    raw_title = item.get('collectionName', '')
-                    raw_desc = item.get('description', '')
-                    s_narr, s_ser, s_part = extract_details_smart(raw_title, raw_desc)
-                    
-                    results.append({
-                        "title": raw_title, "authors": item.get('artistName', ''),
-                        "narrators": s_narr, "series": s_ser, "part": s_part, 
-                        "summary": raw_desc, "image": img, "releaseDate": item.get('releaseDate', '')
-                    })
-        else: # Google
-            r = requests.get(GOOGLE_BOOKS_API, params={"q": query, "maxResults": 10, "langRestrict": "en"}, timeout=5)
-            if r.status_code == 200:
-                for item in r.json().get('items', []):
-                    info = item.get('volumeInfo', {})
-                    img = info.get('imageLinks', {}).get('thumbnail', '').replace('http:', 'https:')
-                    auths = info.get('authors', [])
-                    raw_title = info.get('title', '')
-                    raw_desc = info.get('description', '')
-                    s_narr, s_ser, s_part = extract_details_smart(raw_title, raw_desc)
+        r = requests.get(AUDNEXUS_API, params={'q': query}, headers=headers, timeout=10)
+        r.raise_for_status()
+        data = r.json()
+        results = []
+        for b in data:
+            results.append({
+                "title": b.get('title'),
+                "authors": ", ".join(b.get('authors', [])),
+                "narrators": ", ".join(b.get('narrators', [])),
+                "series": b.get('seriesPrimary', ''),
+                "part": b.get('seriesPrimarySequence', ''),
+                "summary": b.get('summary', ''),
+                "image": b.get('image', ''),
+                "releaseDate": b.get('releaseDate', ''),
+                "source": "Audible"
+            })
+        return results
+    except Exception as e:
+        st.error(f"Audible Error: {e}")
+        return []
 
-                    results.append({
-                        "title": raw_title, "authors": auths[0] if auths else "",
-                        "narrators": s_narr, "series": s_ser, "part": s_part, 
-                        "summary": raw_desc, "image": img, "releaseDate": info.get('publishedDate', '')
-                    })
+def fetch_itunes(query):
+    try:
+        r = requests.get(ITUNES_API, params={'term': query, 'media': 'audiobook', 'limit': 10}, timeout=5)
+        if r.status_code == 200:
+            results = []
+            for item in r.json().get('results', []):
+                img = item.get('artworkUrl100', '').replace('100x100', '600x600')
+                s_narr, s_ser, s_part = extract_details_smart(item.get('collectionName', ''), item.get('description', ''))
+                results.append({
+                    "title": item.get('collectionName'), "authors": item.get('artistName'),
+                    "narrators": s_narr, "series": s_ser, "part": s_part, 
+                    "summary": item.get('description', ''), "image": img, "releaseDate": item.get('releaseDate', '')
+                })
+            return results
     except: pass
-    return results
+    return []
+
+def fetch_google(query):
+    try:
+        r = requests.get(GOOGLE_BOOKS_API, params={"q": query, "maxResults": 10, "langRestrict": "en"}, timeout=5)
+        if r.status_code == 200:
+            results = []
+            for item in r.json().get('items', []):
+                info = item.get('volumeInfo', {})
+                img = info.get('imageLinks', {}).get('thumbnail', '').replace('http:', 'https:')
+                auths = info.get('authors', [])
+                s_narr, s_ser, s_part = extract_details_smart(info.get('title', ''), info.get('description', ''), info.get('subtitle', ''))
+                results.append({
+                    "title": info.get('title'), "authors": auths[0] if auths else "",
+                    "narrators": s_narr, "series": s_ser, "part": s_part, 
+                    "summary": info.get('description', ''), "image": img, "releaseDate": info.get('publishedDate', '')
+                })
+            return results
+    except: pass
+    return []
 
 def fetch_metadata_router(query, provider):
-    if provider == "Apple Books": return fetch_metadata(query, "Apple Books")
-    return fetch_metadata(query, "Google Books")
+    if provider == "Audible": return fetch_audnexus(query)
+    elif provider == "Apple Books": return fetch_itunes(query)
+    return fetch_google(query)
 
 # --- PROCESSING ---
 def tag_file(file_path, author, title, series, desc, cover_url, year, track_num, total_tracks):
@@ -312,21 +339,15 @@ def tag_file(file_path, author, title, series, desc, cover_url, year, track_num,
 
 def process_selection(source_data, author, title, series, series_part, desc, cover_url, narrator, publish_year, target_override=None):
     files_to_process = source_data['file_list']
-    
-    # --- MERGE/FIX MODE ---
     if target_override:
         dest_base = target_override
-        # Wipe destination for clean merge
         try:
             for filename in os.listdir(dest_base):
                 file_path = os.path.join(dest_base, filename)
-                if os.path.isfile(file_path) or os.path.islink(file_path):
-                    os.unlink(file_path)
-                elif os.path.isdir(file_path):
-                    shutil.rmtree(file_path)
+                if os.path.isfile(file_path) or os.path.islink(file_path): os.unlink(file_path)
+                elif os.path.isdir(file_path): shutil.rmtree(file_path)
         except: pass
     else:
-        # Standard Import
         clean_author = sanitize_filename(author)
         clean_title = sanitize_filename(title)
         clean_series = sanitize_filename(series)
@@ -336,20 +357,15 @@ def process_selection(source_data, author, title, series, series_part, desc, cov
     files_to_process.sort()
     total = len(files_to_process)
     pad = max(2, len(str(total)))
-    
     bar = st.progress(0)
     for i, src in enumerate(files_to_process):
         ext = os.path.splitext(src)[1]
         name = f"{str(i+1).zfill(pad)} - {sanitize_filename(title)}{ext}"
         dst = os.path.join(dest_base, name)
-        
-        # COPY (Never Move)
         shutil.copy2(src, dst)
-            
         tag_file(dst, author, title, series, desc, cover_url, publish_year, i+1, total)
         bar.progress((i+1)/total)
 
-    # Create Metadata
     abs_meta = {
         "title": title, "authors": [author], "series": [series] if series else [],
         "description": desc, "narrators": [narrator] if narrator else [],
@@ -361,7 +377,6 @@ def process_selection(source_data, author, title, series, series_part, desc, cov
 
     with open(os.path.join(dest_base, "metadata.json"), 'w') as f: json.dump(abs_meta, f, indent=4)
 
-    # History Update
     hist = load_json(HISTORY_FILE, [])
     if source_data['unique_id'] not in hist: hist.append(source_data['unique_id'])
     if source_data['path'] not in hist: hist.append(source_data['path'])
@@ -379,44 +394,97 @@ def process_selection(source_data, author, title, series, series_part, desc, cov
 # --- MAIN LAYOUT ---
 col1, col2, col3 = st.columns([1.5, 2, 1.5])
 
-# ==================== COLUMN 1: QUEUE ====================
-all_items = get_candidates_with_status()
-new_items = [x for x in all_items if x['status_code'] == 0]
-match_items = [x for x in all_items if x['status_code'] == 1]
-existing_items = [x for x in all_items if x['status_code'] == 3]
+# Fetch Separate Lists
+auto_processed, manual_processed = get_candidates_with_status()
 
-# Sync: Explorer -> Queue
+# AUTO LISTS
+new_items = [x for x in auto_processed if x['status_code'] == 0]
+match_items = [x for x in auto_processed if x['status_code'] == 1]
+existing_items = [x for x in auto_processed if x['status_code'] == 3]
+
+# MANUAL LISTS
+built_items = [x for x in manual_processed]
+
+# Sync Explorer -> Queue
 if st.session_state['sync_selection']:
     sync_target = st.session_state['sync_selection']
-    matching = [x for x in all_items if x['path'] == sync_target or sync_target.startswith(x['path'])]
+    all_known = auto_processed + manual_processed
+    matching = [x for x in all_known if x['path'] == sync_target or sync_target.startswith(x['path'])]
     if matching:
         st.session_state['current_selection_data'] = matching[0]
         st.toast(f"Matched: {matching[0]['name']}")
         st.session_state['sync_selection'] = None
 
+# --- COLUMN 1: TABS ---
 with col1:
-    tab_new, tab_match, tab_exist = st.tabs(["🆕 Untidy", "⚠️ Matches", "📚 Imported"])
+    tab_new, tab_built, tab_match, tab_exist = st.tabs(["🆕 Untidy", "🛠️ Built", "⚠️ Match", "📚 Done"])
     
+    # Auto-Deselect Helper: Clears other keys when one is selected
+    def on_grid_select(grid_name):
+        if grid_name == 'untidy': 
+            st.session_state['grid_key_manual'] += 1
+            st.session_state['grid_key_match'] += 1
+            st.session_state['grid_key_done'] += 1
+        elif grid_name == 'built':
+            st.session_state['grid_key_auto'] += 1
+            st.session_state['grid_key_match'] += 1
+            st.session_state['grid_key_done'] += 1
+        elif grid_name == 'match':
+            st.session_state['grid_key_auto'] += 1
+            st.session_state['grid_key_manual'] += 1
+            st.session_state['grid_key_done'] += 1
+        elif grid_name == 'done':
+            st.session_state['grid_key_auto'] += 1
+            st.session_state['grid_key_manual'] += 1
+            st.session_state['grid_key_match'] += 1
+
     with tab_new:
         if not new_items: st.info("Empty.")
         else:
             df_new = pd.DataFrame(new_items)
-            sel_new = st.dataframe(df_new[['name']], column_config={"name": st.column_config.TextColumn("New Books")}, use_container_width=True, hide_index=True, height=600, on_select="rerun", selection_mode="single-row", key="grid_new")
-            if sel_new.selection.rows: st.session_state['current_selection_data'] = new_items[sel_new.selection.rows[0]]
+            sel = st.dataframe(
+                df_new[['name']], column_config={"name": "Folder Name"},
+                use_container_width=True, hide_index=True, height=600,
+                on_select=lambda: on_grid_select('untidy'), selection_mode="single-row",
+                key=f"grid_auto_{st.session_state['grid_key_auto']}"
+            )
+            if sel.selection.rows: st.session_state['current_selection_data'] = new_items[sel.selection.rows[0]]
+
+    with tab_built:
+        if not built_items: st.info("Use Explorer to bundle files.")
+        else:
+            df_built = pd.DataFrame(built_items)
+            sel = st.dataframe(
+                df_built[['name']], column_config={"name": "Bundle Name"},
+                use_container_width=True, hide_index=True, height=600,
+                on_select=lambda: on_grid_select('built'), selection_mode="single-row",
+                key=f"grid_manual_{st.session_state['grid_key_manual']}"
+            )
+            if sel.selection.rows: st.session_state['current_selection_data'] = built_items[sel.selection.rows[0]]
 
     with tab_match:
-        if not match_items: st.info("No duplicates found.")
+        if not match_items: st.info("No duplicates.")
         else:
             df_match = pd.DataFrame(match_items)
-            sel_match = st.dataframe(df_match[['name']], column_config={"name": st.column_config.TextColumn("Potential Matches")}, use_container_width=True, hide_index=True, height=600, on_select="rerun", selection_mode="single-row", key="grid_match")
-            if sel_match.selection.rows: st.session_state['current_selection_data'] = match_items[sel_match.selection.rows[0]]
+            sel = st.dataframe(
+                df_match[['name']], column_config={"name": "Matches"},
+                use_container_width=True, hide_index=True, height=600,
+                on_select=lambda: on_grid_select('match'), selection_mode="single-row",
+                key=f"grid_match_{st.session_state['grid_key_match']}"
+            )
+            if sel.selection.rows: st.session_state['current_selection_data'] = match_items[sel.selection.rows[0]]
 
     with tab_exist:
         if not existing_items: st.info("Empty.")
         else:
             df_exist = pd.DataFrame(existing_items)
-            sel_exist = st.dataframe(df_exist[['name']], column_config={"name": st.column_config.TextColumn("Imported History")}, use_container_width=True, hide_index=True, height=600, on_select="rerun", selection_mode="single-row", key="grid_exist")
-            if sel_exist.selection.rows: st.session_state['current_selection_data'] = existing_items[sel_exist.selection.rows[0]]
+            sel = st.dataframe(
+                df_exist[['name']], column_config={"name": "History"},
+                use_container_width=True, hide_index=True, height=600,
+                on_select=lambda: on_grid_select('done'), selection_mode="single-row",
+                key=f"grid_done_{st.session_state['grid_key_done']}"
+            )
+            if sel.selection.rows: st.session_state['current_selection_data'] = existing_items[sel.selection.rows[0]]
 
 # Sync: Queue -> Explorer
 selected_item = st.session_state.get('current_selection_data')
@@ -433,24 +501,20 @@ with col2:
     if selected_item:
         st.subheader("✏️ Editor")
         
-        # --- MATCH FIXING MODE ---
         if selected_item['status_code'] == 1:
-            st.warning("⚠️ This book appears to exist in your Library.")
-            st.code(f"Source: {selected_item['path']}", language="text")
-            st.code(f"Target Match: {selected_item['match_path']}", language="text")
-            st.write("Confirming match will **Merge** files and **Fix** metadata.")
+            st.warning("⚠️ Match Found in Library")
+            st.code(f"Target: {os.path.basename(selected_item['match_path'])}", language="text")
             target_override = selected_item['match_path']
         else:
-            st.caption(f"Path: `{selected_item['path']}`")
+            st.caption(f"Path: `{os.path.basename(selected_item['path'])}`")
             target_override = None
 
-        if st.button("❌ Close Editor"):
+        if st.button("❌ Close"):
             st.session_state['current_selection_data'] = None
-            st.session_state['last_synced_book_id'] = None
             st.rerun()
             
         c_src, c_bar, c_btn = st.columns([1, 2, 1])
-        with c_src: provider = st.selectbox("Source", ["Apple Books", "Google Books"], key='search_provider', label_visibility="collapsed")
+        with c_src: provider = st.selectbox("Source", ["Audible", "Apple Books", "Google Books"], key='search_provider', label_visibility="collapsed")
         with c_bar: 
             clean_q = clean_search_query(selected_item['name'])
             q = st.text_input("Search", value=clean_q, label_visibility="collapsed")
@@ -474,7 +538,7 @@ with col2:
 
         if do_search:
             with st.spinner(f"Searching {provider}..."):
-                res = fetch_metadata(q, provider)
+                res = fetch_metadata_router(q, provider)
                 if res:
                     st.session_state['search_results'] = res
                     first = f"{res[0].get('authors')} - {res[0].get('title')}"
@@ -498,28 +562,26 @@ with col2:
             img = st.text_input("Cover URL", key='form_img')
             if img: st.image(img, width=100)
             
-            lbl = "🚀 Make Tidy & Import"
-            if target_override: lbl = "✅ Confirm Match & Merge"
+            lbl = "Import"
+            if target_override: lbl = "Merge & Fix"
             
             if st.form_submit_button(lbl, type="primary"):
                 if auth and titl:
                     process_selection(selected_item, auth, titl, seri, part, desc, img, narr, year, target_override)
                 else: st.error("Author/Title Required")
     else:
-        st.info("👈 Select a book to edit.")
+        st.info("👈 Select a book.")
 
 # ==================== COLUMN 3: EXPLORER ====================
 with col3:
     st.subheader("📂 Explorer & Builder")
     curr_path = st.session_state['exp_path']
-    
     col_u, col_p = st.columns([0.2, 0.8])
     with col_u:
         if st.button("⬆️"):
             st.session_state['exp_path'] = os.path.dirname(curr_path)
             st.rerun()
-    with col_p:
-        st.caption(f".../{os.path.basename(curr_path)}/")
+    with col_p: st.caption(f".../{os.path.basename(curr_path)}/")
 
     try:
         items = sorted(os.listdir(curr_path))
@@ -544,13 +606,11 @@ with col3:
             if selected_rows:
                 selection_data = [file_list[i] for i in selected_rows]
                 st.markdown("---")
-                
                 if len(selection_data) == 1 and selection_data[0]['type'] == 'dir':
                     if st.button(f"📂 Open '{selection_data[0]['name']}'"):
                         st.session_state['exp_path'] = selection_data[0]['path']
                         st.session_state['sync_selection'] = selection_data[0]['path']
                         st.rerun()
-                        
                 with st.form("manual_bundle"):
                     new_name = st.text_input("New Book Title", value=selection_data[0]['name'])
                     if st.form_submit_button("✨ Bundle as Book"):
@@ -561,9 +621,7 @@ with col3:
                                     for f in fs:
                                         if f.lower().endswith(('.mp3','.m4b','.m4a','.flac')):
                                             final_paths.append(os.path.join(root, f))
-                            else:
-                                final_paths.append(item['path'])
-                        
+                            else: final_paths.append(item['path'])
                         if final_paths:
                             entry = {
                                 "id": f"MANUAL|{time.time()}", "path": curr_path,
@@ -574,7 +632,5 @@ with col3:
                             st.success("Added to Queue!")
                             time.sleep(0.5)
                             st.rerun()
-                        else:
-                            st.error("No audio files found in selection.")
-            
+                        else: st.error("No audio files.")
     except Exception as e: st.error(f"Error: {e}")
