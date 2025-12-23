@@ -8,7 +8,7 @@ services:
     volumes:
       # Remember to verify your Synology paths on the left
       - /volume1/Zack/media/downloads/Audiobooks - MAM - Seeding:/downloads:ro
-      - /volume1/media/audiobooks:/audiobooks:rw
+      - /volume1/Zack/media/audiobooks:/audiobooks:rw
     environment:
       - PUID=0
       - PGID=0
