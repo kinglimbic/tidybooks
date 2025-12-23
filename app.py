@@ -39,7 +39,7 @@ if 'last_jumped_path' not in st.session_state: st.session_state['last_jumped_pat
 if 'manual_books' not in st.session_state: st.session_state['manual_books'] = []
 if 'last_synced_book_id' not in st.session_state: st.session_state['last_synced_book_id'] = None
 
-# Grid Keys (Used to force-deselect other grids)
+# Grid Keys
 if 'grid_key_auto' not in st.session_state: st.session_state['grid_key_auto'] = 0
 if 'grid_key_manual' not in st.session_state: st.session_state['grid_key_manual'] = 0
 if 'grid_key_match' not in st.session_state: st.session_state['grid_key_match'] = 0
@@ -135,7 +135,7 @@ def scan_downloads_snapshot():
                 for stem, file_list in groups.items():
                     unique_id = f"{root}|{stem}"
                     display_name = stem.title()
-                    # Fallback if stem is empty
+                    # Fallback if stem empty
                     if len(display_name) < 2: display_name = folder_name
                     
                     full_paths = [os.path.join(root, f) for f in file_list]
@@ -243,55 +243,27 @@ def extract_details_smart(title, desc, subtitle=""):
         part = match_series_b.group(2).strip()
     return narrator, series, part
 
-def fetch_audnexus_bridge(query):
-    """
-    Step 1: Use DuckDuckGo HTML scrape to find an Audible ASIN.
-    Step 2: Query Audnexus with that ASIN.
-    """
-    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'}
-    
-    # 1. Find ASIN via Search Engine (DuckDuckGo Lite)
-    asin = None
+def fetch_audnexus_direct(asin):
+    """Direct ASIN lookup - Guaranteed to work if ASIN is valid"""
+    if not asin: return []
     try:
-        # Search query: "site:audible.com [Book Title]"
-        ddg_url = "https://html.duckduckgo.com/html/"
-        data = {'q': f"site:audible.com {query}"}
-        resp = requests.post(ddg_url, data=data, headers=headers, timeout=5)
-        
-        # Regex to find B0... IDs in the result links
-        match = re.search(r'audible\.com/pd/.*?([B0][A-Z0-9]{9})', resp.text)
-        if match:
-            asin = match.group(1)
-        else:
-            # Fallback regex for other URL structures
-            match = re.search(r'/([B0][A-Z0-9]{9})\b', resp.text)
-            if match: asin = match.group(1)
-            
-    except: pass
-
-    if not asin:
-        st.warning("Could not find Audible ID (ASIN) for this title.")
-        return []
-
-    # 2. Fetch Data from Audnexus
-    try:
-        r = requests.get(f"{AUDNEXUS_API}/{asin}", headers=headers, timeout=5)
+        # User-Agent is critical
+        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/91.0.4472.124 Safari/537.36'}
+        r = requests.get(f"{AUDNEXUS_API}/{asin}", headers=headers, timeout=10)
         if r.status_code == 200:
             b = r.json()
-            # Normalize to list
             return [{
                 "title": b.get('title'),
                 "authors": ", ".join(b.get('authors', [])),
                 "narrators": ", ".join(b.get('narrators', [])),
-                "seriesPrimary": b.get('seriesPrimary', ''),
-                "seriesPrimarySequence": b.get('seriesPrimarySequence', ''),
+                "series": b.get('seriesPrimary', ''),
+                "part": b.get('seriesPrimarySequence', ''),
                 "summary": b.get('summary', ''),
                 "image": b.get('image', ''),
                 "releaseDate": b.get('releaseDate', ''),
-                "source": f"Audible ({asin})"
+                "source": "Audible (ASIN)"
             }]
     except: pass
-    
     return []
 
 def fetch_itunes(query):
@@ -306,7 +278,7 @@ def fetch_itunes(query):
                 s_narr, s_ser, s_part = extract_details_smart(raw_title, raw_desc)
                 results.append({
                     "title": raw_title, "authors": item.get('artistName'),
-                    "narrators": s_narr, "seriesPrimary": s_ser, "seriesPrimarySequence": s_part, 
+                    "narrators": s_narr, "series": s_ser, "part": s_part, 
                     "summary": raw_desc, "image": img, "releaseDate": item.get('releaseDate', '')
                 })
             return results
@@ -325,16 +297,16 @@ def fetch_google(query):
                 s_narr, s_ser, s_part = extract_details_smart(info.get('title', ''), info.get('description', ''), info.get('subtitle', ''))
                 results.append({
                     "title": info.get('title'), "authors": auths[0] if auths else "",
-                    "narrators": s_narr, "seriesPrimary": s_ser, "seriesPrimarySequence": s_part, 
+                    "narrators": s_narr, "series": s_ser, "part": s_part, 
                     "summary": info.get('description', ''), "image": img, "releaseDate": info.get('publishedDate', '')
                 })
             return results
     except: pass
     return []
 
-def fetch_metadata_router(query, provider):
-    if provider == "Audible": return fetch_audnexus_bridge(query)
-    elif provider == "Apple Books": return fetch_itunes(query)
+def fetch_metadata_router(query, provider, asin=None):
+    if asin: return fetch_audnexus_direct(asin)
+    if provider == "Apple Books": return fetch_itunes(query)
     return fetch_google(query)
 
 # --- PROCESSING ---
@@ -427,22 +399,18 @@ col1, col2, col3 = st.columns([1.5, 2, 1.5])
 # Fetch Data
 auto_processed, manual_processed = get_candidates_with_status()
 
-# Auto Lists
 new_items = [x for x in auto_processed if x['status_code'] == 0]
 match_items = [x for x in auto_processed if x['status_code'] == 1]
 existing_items = [x for x in auto_processed if x['status_code'] == 3]
-
-# Manual List
 built_items = [x for x in manual_processed]
 
-# Sync: Explorer -> Queue
+# Sync
 if st.session_state['sync_selection']:
     sync_target = st.session_state['sync_selection']
     all_known = auto_processed + manual_processed
     matching = [x for x in all_known if x['path'] == sync_target or sync_target.startswith(x['path'])]
     if matching:
         st.session_state['current_selection_data'] = matching[0]
-        # Auto-switch
         if matching[0] in manual_processed:
             st.session_state['grid_key_auto'] += 1
             st.session_state['grid_key_match'] += 1
@@ -451,7 +419,6 @@ if st.session_state['sync_selection']:
             st.session_state['grid_key_manual'] += 1
             st.session_state['grid_key_match'] += 1
             st.session_state['grid_key_done'] += 1
-            
         st.toast(f"Matched: {matching[0]['name']}")
         st.session_state['sync_selection'] = None
 
@@ -541,7 +508,7 @@ with col2:
         st.subheader("✏️ Editor")
         
         if selected_item['status_code'] == 1:
-            st.warning("⚠️ Match Found in Library")
+            st.warning("⚠️ Match Found")
             st.code(f"Target: {os.path.basename(selected_item['match_path'])}", language="text")
             target_override = selected_item['match_path']
         else:
@@ -553,11 +520,14 @@ with col2:
             st.rerun()
             
         c_src, c_bar, c_btn = st.columns([1, 2, 1])
-        with c_src: provider = st.selectbox("Source", ["Audible", "Apple Books", "Google Books"], key='search_provider', label_visibility="collapsed")
+        with c_src: provider = st.selectbox("Source", ["Apple Books", "Google Books"], key='search_provider', label_visibility="collapsed")
         with c_bar: 
             clean_q = clean_search_query(selected_item['name'])
             q = st.text_input("Search", value=clean_q, label_visibility="collapsed")
         with c_btn: do_search = st.button("Search")
+        
+        # --- NEW: DIRECT ASIN INPUT ---
+        asin_input = st.text_input("Or enter Audible ASIN (e.g. B01N2K4S)", placeholder="Direct ID Lookup (Reliable)")
 
         def update_form_state():
             if 'result_selector' in st.session_state and 'search_results' in st.session_state:
@@ -568,16 +538,21 @@ with col2:
                     st.session_state['form_auth'] = data.get('authors', '')
                     st.session_state['form_title'] = data.get('title', '')
                     st.session_state['form_narr'] = data.get('narrators', '')
-                    st.session_state['form_series'] = data.get('seriesPrimary', '')
-                    st.session_state['form_part'] = data.get('seriesPrimarySequence', '')
+                    st.session_state['form_series'] = data.get('series', '')
+                    st.session_state['form_part'] = data.get('part', '')
                     rd = data.get('releaseDate')
-                    st.session_state['form_year'] = rd[:4] if rd else ''
-                    st.session_state['form_desc'] = data.get('summary', '')
-                    st.session_state['form_img'] = data.get('image', '')
+                    st.session_state['form_year'] = rd
 
-        if do_search:
-            with st.spinner(f"Searching {provider}..."):
-                res = fetch_metadata_router(q, provider)
+        # Logic for Search vs ASIN
+        if do_search or asin_input:
+            with st.spinner(f"Searching..."):
+                if asin_input:
+                    # Direct ASIN Mode
+                    res = fetch_metadata_router(q, "Audible", asin_input.strip())
+                else:
+                    # Standard Text Search
+                    res = fetch_metadata_router(q, provider)
+                
                 if res:
                     st.session_state['search_results'] = res
                     first = f"{res[0].get('authors')} - {res[0].get('title')}"
@@ -613,7 +588,7 @@ with col2:
 
 # --- COL 3: EXPLORER ---
 with col3:
-    st.subheader("📂 Explorer & Builder")
+    st.subheader("📂 Explorer")
     curr_path = st.session_state['exp_path']
     col_u, col_p = st.columns([0.2, 0.8])
     with col_u:
@@ -633,7 +608,6 @@ with col3:
         
         if file_list:
             df_files = pd.DataFrame(file_list)
-            # Use Multi-Row so user can check files to bundle
             sel_files = st.dataframe(
                 df_files[['icon', 'name']],
                 column_config={"icon": st.column_config.TextColumn("", width="small")},
