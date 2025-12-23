@@ -34,7 +34,7 @@ for key in default_keys:
 if 'exp_path' not in st.session_state: st.session_state['exp_path'] = DOWNLOAD_DIR
 if 'sync_selection' not in st.session_state: st.session_state['sync_selection'] = None
 if 'current_selection_data' not in st.session_state: st.session_state['current_selection_data'] = None
-if 'search_provider' not in st.session_state: st.session_state['search_provider'] = "Audible" # Default back to Audible
+if 'search_provider' not in st.session_state: st.session_state['search_provider'] = "Apple Books"
 if 'last_jumped_path' not in st.session_state: st.session_state['last_jumped_path'] = None
 if 'manual_books' not in st.session_state: st.session_state['manual_books'] = []
 if 'last_synced_book_id' not in st.session_state: st.session_state['last_synced_book_id'] = None
@@ -135,6 +135,9 @@ def scan_downloads_snapshot():
                 for stem, file_list in groups.items():
                     unique_id = f"{root}|{stem}"
                     display_name = stem.title()
+                    # Fallback if stem is empty
+                    if len(display_name) < 2: display_name = folder_name
+                    
                     full_paths = [os.path.join(root, f) for f in file_list]
                     candidates.append({
                         "id": unique_id, "path": root, "name": display_name,
@@ -211,7 +214,6 @@ def get_candidates_with_status():
     cached_lib = load_json(CACHE_FILE, [])
     if not cached_lib: cached_lib = scan_library_now()
     
-    # Process lists
     auto_processed = calculate_matches(raw_candidates, cached_lib, history)
     manual_processed = calculate_matches(manual_items, cached_lib, history)
     
@@ -241,50 +243,54 @@ def extract_details_smart(title, desc, subtitle=""):
         part = match_series_b.group(2).strip()
     return narrator, series, part
 
-def fetch_audnexus_twostep(query):
+def fetch_audnexus_bridge(query):
     """
-    Two-Step Search:
-    1. Search Audible.com website to find the ASIN (e.g. B0xxxx)
-    2. Use ASIN to query Audnexus API
+    Step 1: Use DuckDuckGo HTML scrape to find an Audible ASIN.
+    Step 2: Query Audnexus with that ASIN.
     """
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-    }
+    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'}
     
-    # Step 1: Scrape ASIN
+    # 1. Find ASIN via Search Engine (DuckDuckGo Lite)
     asin = None
     try:
-        search_url = "https://www.audible.com/search"
-        r_search = requests.get(search_url, params={'keywords': query}, headers=headers, timeout=8)
+        # Search query: "site:audible.com [Book Title]"
+        ddg_url = "https://html.duckduckgo.com/html/"
+        data = {'q': f"site:audible.com {query}"}
+        resp = requests.post(ddg_url, data=data, headers=headers, timeout=5)
         
-        # Regex to find the first ASIN in the search results
-        # Looks for: data-asin="B0xxxxxxxx"
-        match = re.search(r'data-asin="(B0[A-Z0-9]{8})"', r_search.text)
+        # Regex to find B0... IDs in the result links
+        match = re.search(r'audible\.com/pd/.*?([B0][A-Z0-9]{9})', resp.text)
         if match:
             asin = match.group(1)
-    except:
-        pass # Fail silently to step 2
+        else:
+            # Fallback regex for other URL structures
+            match = re.search(r'/([B0][A-Z0-9]{9})\b', resp.text)
+            if match: asin = match.group(1)
+            
+    except: pass
 
-    # Step 2: Fetch Metadata
-    if asin:
-        try:
-            api_url = f"{AUDNEXUS_API}/{asin}"
-            r_api = requests.get(api_url, headers=headers, timeout=8)
-            if r_api.status_code == 200:
-                b = r_api.json()
-                # Return list (standard format)
-                return [{
-                    "title": b.get('title'),
-                    "authors": ", ".join(b.get('authors', [])),
-                    "narrators": ", ".join(b.get('narrators', [])),
-                    "series": b.get('seriesPrimary', ''),
-                    "part": b.get('seriesPrimarySequence', ''),
-                    "summary": b.get('summary', ''),
-                    "image": b.get('image', ''),
-                    "releaseDate": b.get('releaseDate', ''),
-                    "source": "Audible"
-                }]
-        except: pass
+    if not asin:
+        st.warning("Could not find Audible ID (ASIN) for this title.")
+        return []
+
+    # 2. Fetch Data from Audnexus
+    try:
+        r = requests.get(f"{AUDNEXUS_API}/{asin}", headers=headers, timeout=5)
+        if r.status_code == 200:
+            b = r.json()
+            # Normalize to list
+            return [{
+                "title": b.get('title'),
+                "authors": ", ".join(b.get('authors', [])),
+                "narrators": ", ".join(b.get('narrators', [])),
+                "seriesPrimary": b.get('seriesPrimary', ''),
+                "seriesPrimarySequence": b.get('seriesPrimarySequence', ''),
+                "summary": b.get('summary', ''),
+                "image": b.get('image', ''),
+                "releaseDate": b.get('releaseDate', ''),
+                "source": f"Audible ({asin})"
+            }]
+    except: pass
     
     return []
 
@@ -300,7 +306,7 @@ def fetch_itunes(query):
                 s_narr, s_ser, s_part = extract_details_smart(raw_title, raw_desc)
                 results.append({
                     "title": raw_title, "authors": item.get('artistName'),
-                    "narrators": s_narr, "series": s_ser, "part": s_part, 
+                    "narrators": s_narr, "seriesPrimary": s_ser, "seriesPrimarySequence": s_part, 
                     "summary": raw_desc, "image": img, "releaseDate": item.get('releaseDate', '')
                 })
             return results
@@ -319,7 +325,7 @@ def fetch_google(query):
                 s_narr, s_ser, s_part = extract_details_smart(info.get('title', ''), info.get('description', ''), info.get('subtitle', ''))
                 results.append({
                     "title": info.get('title'), "authors": auths[0] if auths else "",
-                    "narrators": s_narr, "series": s_ser, "part": s_part, 
+                    "narrators": s_narr, "seriesPrimary": s_ser, "seriesPrimarySequence": s_part, 
                     "summary": info.get('description', ''), "image": img, "releaseDate": info.get('publishedDate', '')
                 })
             return results
@@ -327,7 +333,7 @@ def fetch_google(query):
     return []
 
 def fetch_metadata_router(query, provider):
-    if provider == "Audible": return fetch_audnexus_twostep(query)
+    if provider == "Audible": return fetch_audnexus_bridge(query)
     elif provider == "Apple Books": return fetch_itunes(query)
     return fetch_google(query)
 
@@ -362,24 +368,15 @@ def tag_file(file_path, author, title, series, desc, cover_url, year, track_num,
 def process_selection(source_data, author, title, series, series_part, desc, cover_url, narrator, publish_year, target_override=None):
     files_to_process = source_data['file_list']
     
-    # --- MERGE/FIX MODE LOGIC ---
     if target_override:
         dest_base = target_override
-        # NEW: Clean the destination folder first to prevent double copies.
-        # We wipe it so we can replace the "messy" version with the "clean" version.
         try:
-            # We iterate and delete contents, preserving the folder itself
             for filename in os.listdir(dest_base):
                 file_path = os.path.join(dest_base, filename)
-                if os.path.isfile(file_path) or os.path.islink(file_path):
-                    os.unlink(file_path)
-                elif os.path.isdir(file_path):
-                    shutil.rmtree(file_path)
-        except Exception as e:
-            st.error(f"Error cleaning destination: {e}")
-            return # Stop to be safe
+                if os.path.isfile(file_path) or os.path.islink(file_path): os.unlink(file_path)
+                elif os.path.isdir(file_path): shutil.rmtree(file_path)
+        except: pass
     else:
-        # Standard Import (New Folder)
         clean_author = sanitize_filename(author)
         clean_title = sanitize_filename(title)
         clean_series = sanitize_filename(series)
@@ -395,15 +392,10 @@ def process_selection(source_data, author, title, series, series_part, desc, cov
         ext = os.path.splitext(src)[1]
         name = f"{str(i+1).zfill(pad)} - {sanitize_filename(title)}{ext}"
         dst = os.path.join(dest_base, name)
-        
-        # --- CRITICAL: ALWAYS COPY (NEVER MOVE) ---
-        # Because source is Read-Only torrent folder
         shutil.copy2(src, dst)
-            
         tag_file(dst, author, title, series, desc, cover_url, publish_year, i+1, total)
         bar.progress((i+1)/total)
 
-    # Create Metadata
     abs_meta = {
         "title": title, "authors": [author], "series": [series] if series else [],
         "description": desc, "narrators": [narrator] if narrator else [],
@@ -415,7 +407,6 @@ def process_selection(source_data, author, title, series, series_part, desc, cov
 
     with open(os.path.join(dest_base, "metadata.json"), 'w') as f: json.dump(abs_meta, f, indent=4)
 
-    # History Update
     hist = load_json(HISTORY_FILE, [])
     if source_data['unique_id'] not in hist: hist.append(source_data['unique_id'])
     if source_data['path'] not in hist: hist.append(source_data['path'])
@@ -425,10 +416,7 @@ def process_selection(source_data, author, title, series, series_part, desc, cov
         st.session_state['manual_books'] = [b for b in st.session_state['manual_books'] if b['id'] != source_data['unique_id']]
 
     st.success(f"✅ Success: {title}")
-    
-    # CLEAR CACHE to ensure the new book moves to "Done"
     st.cache_data.clear()
-    
     st.session_state['current_selection_data'] = None
     time.sleep(1)
     st.rerun()
@@ -454,7 +442,7 @@ if st.session_state['sync_selection']:
     matching = [x for x in all_known if x['path'] == sync_target or sync_target.startswith(x['path'])]
     if matching:
         st.session_state['current_selection_data'] = matching[0]
-        # Auto-Switch Logic: If manual, bump manual key. If auto, bump auto key.
+        # Auto-switch
         if matching[0] in manual_processed:
             st.session_state['grid_key_auto'] += 1
             st.session_state['grid_key_match'] += 1
@@ -471,7 +459,6 @@ if st.session_state['sync_selection']:
 with col1:
     tab_new, tab_built, tab_match, tab_exist = st.tabs(["🆕 Untidy", "🛠️ Built", "⚠️ Match", "📚 Done"])
     
-    # Auto-Deselect Helper
     def on_grid_select(grid_name):
         if grid_name == 'untidy': 
             st.session_state['grid_key_manual'] += 1
@@ -553,21 +540,16 @@ with col2:
     if selected_item:
         st.subheader("✏️ Editor")
         
-        # --- MATCH FIXING MODE ---
         if selected_item['status_code'] == 1:
             st.warning("⚠️ Match Found in Library")
-            st.code(f"Source: {selected_item['path']}", language="text")
-            st.code(f"Target: {selected_item['match_path']}", language="text")
-            
-            st.write("Confirming match will **Merge** files and **Fix** metadata.")
+            st.code(f"Target: {os.path.basename(selected_item['match_path'])}", language="text")
             target_override = selected_item['match_path']
         else:
-            st.caption(f"Path: `{selected_item['path']}`")
+            st.caption(f"Path: `{os.path.basename(selected_item['path'])}`")
             target_override = None
 
-        if st.button("❌ Close Editor"):
+        if st.button("❌ Close"):
             st.session_state['current_selection_data'] = None
-            st.session_state['last_synced_book_id'] = None
             st.rerun()
             
         c_src, c_bar, c_btn = st.columns([1, 2, 1])
@@ -586,8 +568,8 @@ with col2:
                     st.session_state['form_auth'] = data.get('authors', '')
                     st.session_state['form_title'] = data.get('title', '')
                     st.session_state['form_narr'] = data.get('narrators', '')
-                    st.session_state['form_series'] = data.get('series', '')
-                    st.session_state['form_part'] = data.get('part', '')
+                    st.session_state['form_series'] = data.get('seriesPrimary', '')
+                    st.session_state['form_part'] = data.get('seriesPrimarySequence', '')
                     rd = data.get('releaseDate')
                     st.session_state['form_year'] = rd[:4] if rd else ''
                     st.session_state['form_desc'] = data.get('summary', '')
@@ -619,29 +601,26 @@ with col2:
             img = st.text_input("Cover URL", key='form_img')
             if img: st.image(img, width=100)
             
-            # Dynamic Button Label
-            lbl = "🚀 Make Tidy & Import"
-            if target_override: lbl = "✅ Confirm Match & Merge"
+            lbl = "Import"
+            if target_override: lbl = "Merge & Fix"
             
             if st.form_submit_button(lbl, type="primary"):
                 if auth and titl:
                     process_selection(selected_item, auth, titl, seri, part, desc, img, narr, year, target_override)
                 else: st.error("Author/Title Required")
     else:
-        st.info("👈 Select a book to edit.")
+        st.info("👈 Select a book.")
 
-# ==================== COLUMN 3: EXPLORER ====================
+# --- COL 3: EXPLORER ---
 with col3:
     st.subheader("📂 Explorer & Builder")
     curr_path = st.session_state['exp_path']
-    
     col_u, col_p = st.columns([0.2, 0.8])
     with col_u:
         if st.button("⬆️"):
             st.session_state['exp_path'] = os.path.dirname(curr_path)
             st.rerun()
-    with col_p:
-        st.caption(f".../{os.path.basename(curr_path)}/")
+    with col_p: st.caption(f".../{os.path.basename(curr_path)}/")
 
     try:
         items = sorted(os.listdir(curr_path))
@@ -654,8 +633,7 @@ with col3:
         
         if file_list:
             df_files = pd.DataFrame(file_list)
-            
-            # --- MULTI SELECT TABLE ---
+            # Use Multi-Row so user can check files to bundle
             sel_files = st.dataframe(
                 df_files[['icon', 'name']],
                 column_config={"icon": st.column_config.TextColumn("", width="small")},
@@ -663,19 +641,16 @@ with col3:
                 on_select="rerun", selection_mode="multi-row"
             )
             
-            # Handle Selections
             selected_rows = sel_files.selection.rows
             
             if selected_rows:
                 selection_data = [file_list[i] for i in selected_rows]
                 st.markdown("---")
-                
                 if len(selection_data) == 1 and selection_data[0]['type'] == 'dir':
                     if st.button(f"📂 Open '{selection_data[0]['name']}'"):
                         st.session_state['exp_path'] = selection_data[0]['path']
                         st.session_state['sync_selection'] = selection_data[0]['path']
                         st.rerun()
-                        
                 with st.form("manual_bundle"):
                     new_name = st.text_input("New Book Title", value=selection_data[0]['name'])
                     if st.form_submit_button("✨ Bundle as Book"):
@@ -686,9 +661,7 @@ with col3:
                                     for f in fs:
                                         if f.lower().endswith(('.mp3','.m4b','.m4a','.flac')):
                                             final_paths.append(os.path.join(root, f))
-                            else:
-                                final_paths.append(item['path'])
-                        
+                            else: final_paths.append(item['path'])
                         if final_paths:
                             entry = {
                                 "id": f"MANUAL|{time.time()}", "path": curr_path,
@@ -699,7 +672,5 @@ with col3:
                             st.success("Added to Queue!")
                             time.sleep(0.5)
                             st.rerun()
-                        else:
-                            st.error("No audio files found in selection.")
-            
+                        else: st.error("No audio files.")
     except Exception as e: st.error(f"Error: {e}")
