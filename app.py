@@ -18,7 +18,6 @@ HISTORY_FILE = os.path.join(DATA_DIR, "processed_log.json")
 CACHE_FILE = os.path.join(DATA_DIR, "library_map_cache.json")
 
 # API ENDPOINTS
-AUDNEXUS_API = "https://api.audnex.us/books"
 ITUNES_API = "https://itunes.apple.com/search"
 GOOGLE_BOOKS_API = "https://www.googleapis.com/books/v1/volumes"
 
@@ -34,7 +33,7 @@ for key in default_keys:
 if 'exp_path' not in st.session_state: st.session_state['exp_path'] = DOWNLOAD_DIR
 if 'sync_selection' not in st.session_state: st.session_state['sync_selection'] = None
 if 'current_selection_data' not in st.session_state: st.session_state['current_selection_data'] = None
-if 'search_provider' not in st.session_state: st.session_state['search_provider'] = "Audible" # Default back to Audible
+if 'search_provider' not in st.session_state: st.session_state['search_provider'] = "Apple Books"
 if 'last_jumped_path' not in st.session_state: st.session_state['last_jumped_path'] = None
 if 'manual_books' not in st.session_state: st.session_state['manual_books'] = []
 if 'last_synced_book_id' not in st.session_state: st.session_state['last_synced_book_id'] = None
@@ -123,7 +122,7 @@ def scan_downloads_snapshot():
             
             is_root = os.path.abspath(root) == os.path.abspath(DOWNLOAD_DIR)
 
-            # 1. Collection/Root Logic
+            # 1. Collection/Root Logic (Group by File Name)
             if "collection" in folder_name.lower() or is_root:
                 groups = {}
                 for f in audio_files:
@@ -211,7 +210,6 @@ def get_candidates_with_status():
     cached_lib = load_json(CACHE_FILE, [])
     if not cached_lib: cached_lib = scan_library_now()
     
-    # Process lists
     auto_processed = calculate_matches(raw_candidates, cached_lib, history)
     manual_processed = calculate_matches(manual_items, cached_lib, history)
     
@@ -240,53 +238,6 @@ def extract_details_smart(title, desc, subtitle=""):
         series = match_series_b.group(1).strip()
         part = match_series_b.group(2).strip()
     return narrator, series, part
-
-def fetch_audnexus_twostep(query):
-    """
-    Two-Step Search:
-    1. Search Audible.com website to find the ASIN (e.g. B0xxxx)
-    2. Use ASIN to query Audnexus API
-    """
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
-    }
-    
-    # Step 1: Scrape ASIN
-    asin = None
-    try:
-        search_url = "https://www.audible.com/search"
-        r_search = requests.get(search_url, params={'keywords': query}, headers=headers, timeout=8)
-        
-        # Regex to find the first ASIN in the search results
-        # Looks for: data-asin="B0xxxxxxxx"
-        match = re.search(r'data-asin="(B0[A-Z0-9]{8})"', r_search.text)
-        if match:
-            asin = match.group(1)
-    except:
-        pass # Fail silently to step 2
-
-    # Step 2: Fetch Metadata
-    if asin:
-        try:
-            api_url = f"{AUDNEXUS_API}/{asin}"
-            r_api = requests.get(api_url, headers=headers, timeout=8)
-            if r_api.status_code == 200:
-                b = r_api.json()
-                # Return list (standard format)
-                return [{
-                    "title": b.get('title'),
-                    "authors": ", ".join(b.get('authors', [])),
-                    "narrators": ", ".join(b.get('narrators', [])),
-                    "series": b.get('seriesPrimary', ''),
-                    "part": b.get('seriesPrimarySequence', ''),
-                    "summary": b.get('summary', ''),
-                    "image": b.get('image', ''),
-                    "releaseDate": b.get('releaseDate', ''),
-                    "source": "Audible"
-                }]
-        except: pass
-    
-    return []
 
 def fetch_itunes(query):
     try:
@@ -327,8 +278,7 @@ def fetch_google(query):
     return []
 
 def fetch_metadata_router(query, provider):
-    if provider == "Audible": return fetch_audnexus_twostep(query)
-    elif provider == "Apple Books": return fetch_itunes(query)
+    if provider == "Apple Books": return fetch_itunes(query)
     return fetch_google(query)
 
 # --- PROCESSING ---
@@ -548,7 +498,7 @@ with col2:
             st.rerun()
             
         c_src, c_bar, c_btn = st.columns([1, 2, 1])
-        with c_src: provider = st.selectbox("Source", ["Audible", "Apple Books", "Google Books"], key='search_provider', label_visibility="collapsed")
+        with c_src: provider = st.selectbox("Source", ["Apple Books", "Google Books"], key='search_provider', label_visibility="collapsed")
         with c_bar: 
             clean_q = clean_search_query(selected_item['name'])
             q = st.text_input("Search", value=clean_q, label_visibility="collapsed")
@@ -608,7 +558,7 @@ with col2:
 
 # --- COL 3: EXPLORER ---
 with col3:
-    st.subheader("📂 Explorer")
+    st.subheader("📂 Explorer & Builder")
     curr_path = st.session_state['exp_path']
     col_u, col_p = st.columns([0.2, 0.8])
     with col_u:
