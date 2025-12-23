@@ -5,41 +5,108 @@ import requests
 import json
 import re
 from mutagen.mp4 import MP4, MP4Cover
-from mutagen.id3 import ID3, TIT2, TPE1, TALB, APIC, COMM
+from mutagen.id3 import ID3, TIT2, TPE1, TALB, APIC, COMM, TRCK
 import time
 
 # --- Configuration ---
-# These match the container internal paths
 DOWNLOAD_DIR = "/downloads"
 LIBRARY_DIR = "/audiobooks"
+HISTORY_FILE = "processed_log.json"
 AUDNEXUS_API = "https://api.audnexus.com/books"
 
-# Update 1: Page Title
 st.set_page_config(page_title="TidyBooks", layout="wide", page_icon="📚")
 
 # --- Helper Functions ---
+
+def load_history():
+    if os.path.exists(HISTORY_FILE):
+        with open(HISTORY_FILE, 'r') as f:
+            return json.load(f)
+    return []
+
+def save_to_history(path):
+    history = load_history()
+    if path not in history:
+        history.append(path)
+        with open(HISTORY_FILE, 'w') as f:
+            json.dump(history, f)
+
 def sanitize_filename(name):
-    """Removes illegal characters for file/folder names."""
     if not name: return "Unknown"
     clean = name.replace("/", "-").replace("\\", "-")
     return re.sub(r'[<>:"|?*]', '', clean).strip()
 
 def get_candidates():
-    """Scans download folder for audio files recursively."""
+    """
+    Scans for items and assigns status:
+    Status 0: New/Untidy (White)
+    Status 1: Exists in Library (Yellow)
+    Status 2: Already Processed (Green)
+    """
+    history = load_history()
     candidates = []
+    
     if not os.path.exists(DOWNLOAD_DIR):
         return []
+
+    # Get list of folders currently in the Library (for the Yellow check)
+    try:
+        library_folders = [f for f in os.listdir(LIBRARY_DIR) if os.path.isdir(os.path.join(LIBRARY_DIR, f))]
+    except:
+        library_folders = []
+
+    for item in os.listdir(DOWNLOAD_DIR):
+        full_path = os.path.join(DOWNLOAD_DIR, item)
+        is_dir = os.path.isdir(full_path)
         
-    for root, dirs, files in os.walk(DOWNLOAD_DIR):
-        for file in files:
-            if file.lower().endswith(('.mp3', '.m4b', '.m4a', '.flac')):
-                full_path = os.path.join(root, file)
-                rel_path = os.path.relpath(full_path, DOWNLOAD_DIR)
-                candidates.append((rel_path, full_path))
-    return sorted(candidates, key=lambda x: x[0])
+        # Filter for audio content
+        has_audio = False
+        if is_dir:
+            for root, _, files in os.walk(full_path):
+                if any(f.lower().endswith(('.mp3', '.m4b', '.m4a', '.flac')) for f in files):
+                    has_audio = True
+                    break
+        elif item.lower().endswith(('.mp3', '.m4b', '.m4a', '.flac')):
+            has_audio = True
+
+        if has_audio:
+            # --- STATUS LOGIC ---
+            status = 0 # Default: Untidy
+            display_prefix = ""
+            match_path = None # Where the "Messy" version exists
+
+            # 1. Check Green (History)
+            if full_path in history:
+                status = 2
+                display_prefix = "✅ "
+            
+            # 2. Check Yellow (Exists in Library but not in History)
+            # We look for a folder in /audiobooks that matches the download name
+            elif item in library_folders:
+                status = 1
+                display_prefix = "🟨 "
+                match_path = os.path.join(LIBRARY_DIR, item)
+
+            # Determine type
+            type_str = "dir" if is_dir else "file"
+            
+            # Label for the UI
+            label = f"{display_prefix}{item}"
+            
+            candidates.append({
+                "label": label,
+                "path": full_path,
+                "type": type_str,
+                "status": status,
+                "match_path": match_path,
+                "name": item
+            })
+
+    # Sort: Status 0 (New) -> Status 1 (Yellow) -> Status 2 (Green/Bottom)
+    # Secondary Sort: Alphabetical
+    return sorted(candidates, key=lambda x: (x['status'], x['name']))
 
 def fetch_metadata(query):
-    """Searches Audnexus (Audible mirror)."""
     try:
         params = {'q': query}
         r = requests.get(AUDNEXUS_API, params=params)
@@ -49,36 +116,18 @@ def fetch_metadata(query):
         st.error(f"API Error: {e}")
     return []
 
-def process_book(source_path, author, title, series, series_part, desc, cover_url, narrator, publish_year):
-    """Copies, organizes, tags, and generates JSON for ABS."""
-    
-    clean_author = sanitize_filename(author)
-    clean_title = sanitize_filename(title)
-    clean_series = sanitize_filename(series)
-    
-    if clean_series:
-        dest_folder = os.path.join(LIBRARY_DIR, clean_author, clean_series)
-    else:
-        dest_folder = os.path.join(LIBRARY_DIR, clean_author)
-    
-    os.makedirs(dest_folder, exist_ok=True)
-    
-    ext = os.path.splitext(source_path)[1]
-    dest_filename = f"{clean_title}{ext}"
-    dest_path = os.path.join(dest_folder, dest_filename)
-
-    with st.spinner(f"Tidying up {clean_title}..."):
-        shutil.copy2(source_path, dest_path)
-
+def tag_file(file_path, author, title, series, desc, cover_url, year, track_num, total_tracks):
+    ext = os.path.splitext(file_path)[1].lower()
     try:
-        if ext.lower() in ['.m4b', '.m4a']:
-            audio = MP4(dest_path)
+        if ext in ['.m4b', '.m4a']:
+            audio = MP4(file_path)
             if audio.tags is None: audio.add_tags()
             audio.tags['\xa9nam'] = title
             audio.tags['\xa9ART'] = author
-            audio.tags['\xa9alb'] = clean_series if clean_series else title
+            audio.tags['\xa9alb'] = series if series else title
             audio.tags['desc'] = desc
-            if publish_year: audio.tags['\xa9day'] = publish_year
+            audio.tags['trkn'] = [(track_num, total_tracks)]
+            if year: audio.tags['\xa9day'] = year
             if cover_url:
                 try:
                     img_data = requests.get(cover_url).content
@@ -86,23 +135,105 @@ def process_book(source_path, author, title, series, series_part, desc, cover_ur
                 except: pass
             audio.save()
             
-        elif ext.lower() == '.mp3':
-            try: audio = ID3(dest_path) 
+        elif ext == '.mp3':
+            try: audio = ID3(file_path) 
             except: audio = ID3()
             audio.add(TIT2(encoding=3, text=title))
             audio.add(TPE1(encoding=3, text=author))
-            audio.add(TALB(encoding=3, text=clean_series if clean_series else title))
+            audio.add(TALB(encoding=3, text=series if series else title))
+            audio.add(TRCK(encoding=3, text=f"{track_num}/{total_tracks}"))
             if desc: audio.add(COMM(encoding=3, lang='eng', desc='Description', text=desc))
             if cover_url:
                 try:
                     img_data = requests.get(cover_url).content
                     audio.add(APIC(3, 'image/jpeg', 3, 'Front Cover', img_data))
                 except: pass
-            audio.save(dest_path)
-
+            audio.save(file_path)
     except Exception as e:
-        st.warning(f"Tagging warning: {e}")
+        print(f"Error tagging: {e}")
 
+def process_selection(source_data, author, title, series, series_part, desc, cover_url, narrator, publish_year):
+    """
+    Handles Copying OR Moving (Fix Mode).
+    source_data contains: path, type, status, match_path
+    """
+    
+    # --- DETERMINE MODE ---
+    # If Status is Yellow (1), we FIX the existing library files (MOVE).
+    # If Status is White (0), we IMPORT from downloads (COPY).
+    mode = "COPY"
+    working_source_path = source_data['path'] # Default to download folder
+    
+    if source_data['status'] == 1 and source_data['match_path']:
+        mode = "FIX"
+        working_source_path = source_data['match_path'] # Switch to library folder
+        st.info(f"🟨 Fix Mode Detected: Reorganizing existing files from {working_source_path}")
+
+    # 1. Setup Destination
+    clean_author = sanitize_filename(author)
+    clean_title = sanitize_filename(title)
+    clean_series = sanitize_filename(series)
+    
+    if clean_series:
+        dest_base_folder = os.path.join(LIBRARY_DIR, clean_author, clean_series, clean_title)
+    else:
+        dest_base_folder = os.path.join(LIBRARY_DIR, clean_author, clean_title)
+    
+    os.makedirs(dest_base_folder, exist_ok=True)
+
+    # 2. Gather Files
+    files_to_process = []
+    if source_data['type'] == "dir":
+        for root, _, files in os.walk(working_source_path):
+            for file in files:
+                if file.lower().endswith(('.mp3', '.m4b', '.m4a', '.flac')):
+                    files_to_process.append(os.path.join(root, file))
+        files_to_process.sort() 
+    else:
+        files_to_process.append(working_source_path)
+
+    total_files = len(files_to_process)
+    pad_length = len(str(total_files))
+    if pad_length < 2: pad_length = 2 
+
+    # 3. Process Batch
+    progress_bar = st.progress(0)
+    status_text = st.empty()
+
+    for i, src_file in enumerate(files_to_process):
+        status_text.text(f"Processing track {i+1} of {total_files}...")
+        ext = os.path.splitext(src_file)[1]
+        
+        # Naming: 01 - Title.ext
+        if total_files > 1:
+            track_str = str(i+1).zfill(pad_length)
+            new_filename = f"{track_str} - {clean_title}{ext}"
+        else:
+            new_filename = f"{clean_title}{ext}"
+            
+        dest_file_path = os.path.join(dest_base_folder, new_filename)
+        
+        # ACTION: COPY VS MOVE
+        if mode == "FIX":
+            # Avoid error if moving file to itself
+            if os.path.abspath(src_file) != os.path.abspath(dest_file_path):
+                shutil.move(src_file, dest_file_path)
+        else:
+            shutil.copy2(src_file, dest_file_path)
+        
+        # Tag
+        tag_file(dest_file_path, author, title, series, desc, cover_url, publish_year, i+1, total_files)
+        progress_bar.progress((i + 1) / total_files)
+
+    # 4. Cleanup (Only in Fix Mode)
+    if mode == "FIX" and source_data['type'] == "dir":
+        # Remove the old messy folder if it is now empty
+        try:
+            shutil.rmtree(working_source_path)
+        except Exception as e:
+            st.warning(f"Could not delete old folder: {e}")
+
+    # 5. Metadata JSON
     abs_metadata = {
         "title": title,
         "authors": [author],
@@ -112,24 +243,22 @@ def process_book(source_path, author, title, series, series_part, desc, cover_ur
         "publishYear": publish_year,
         "cover": cover_url
     }
-    
     if series and series_part:
-        try:
-            abs_metadata["series"] = [{"sequence": series_part, "name": series}]
-        except:
-            abs_metadata["series"] = [series]
+        try: abs_metadata["series"] = [{"sequence": series_part, "name": series}]
+        except: abs_metadata["series"] = [series]
 
-    json_path = os.path.join(dest_folder, "metadata.json")
-    with open(json_path, 'w', encoding='utf-8') as f:
+    with open(os.path.join(dest_base_folder, "metadata.json"), 'w', encoding='utf-8') as f:
         json.dump(abs_metadata, f, indent=4)
 
-    st.success(f"✅ TidyBooks: Imported {clean_title}")
+    # 6. Mark Download Path as Done (Even if we fixed the library copy, we mark the download as processed)
+    save_to_history(source_data['path'])
+
+    st.success(f"✅ TidyBooks: Successfully {'Fixed' if mode == 'FIX' else 'Imported'} {clean_title}")
     st.balloons()
     time.sleep(2)
     st.rerun()
 
 # --- GUI Layout ---
-# Update 2: Visible Header
 st.title("🎧 TidyBooks")
 
 col1, col2 = st.columns([1, 2])
@@ -139,73 +268,28 @@ with col1:
     if st.button("Refresh List"):
         st.rerun()
         
-    files = get_candidates()
-    if not files:
-        st.info("No audio files found in /downloads.")
-        selected_file_tuple = None
+    items = get_candidates()
+    
+    if not items:
+        st.info("No items found.")
+        selected_item = None
     else:
-        selected_rel_path = st.radio("Select file:", [f[0] for f in files], index=0)
-        selected_file_full = next((f[1] for f in files if f[0] == selected_rel_path), None)
+        # Display list with indicators
+        selected_label = st.radio("Select Book:", [x['label'] for x in items], index=0)
+        selected_item = next((x for x in items if x['label'] == selected_label), None)
 
 with col2:
-    if files and selected_file_full:
-        filename_only = os.path.basename(selected_file_full)
-        st.subheader("✏️ Tidy Details")
-        st.caption(f"File: `{filename_only}`")
+    if selected_item:
+        folder_name = selected_item['name']
+        
+        # Header Dynamic Status
+        if selected_item['status'] == 1:
+            st.warning("⚠️ **Found in Library:** Files exist but may be unorganized. 'Make Tidy' will fix them in place (Move) instead of copying.")
+        elif selected_item['status'] == 2:
+            st.success("✅ **Already Processed:** This book is in your history.")
+
+        st.subheader("✏️ Book Details")
+        st.caption(f"Target: `{folder_name}`")
         
         with st.expander("🔍 Search Database", expanded=True):
-            col_search, col_btn = st.columns([3,1])
-            with col_search:
-                search_query = st.text_input("Title / Author", value=filename_only.split('.')[0].replace('_', ' '))
-            with col_btn:
-                st.write("##") 
-                do_search = st.button("Search")
-            
-            found_meta = {}
-            if do_search:
-                results = fetch_metadata(search_query)
-                if results:
-                    st.session_state['search_results'] = results
-                else:
-                    st.warning("No matches found.")
-            
-            if 'search_results' in st.session_state and st.session_state['search_results']:
-                options = {f"{b.get('authors')} - {b.get('title')}": b for b in st.session_state['search_results']}
-                selected_meta_key = st.selectbox("Quick Fill:", options.keys())
-                if selected_meta_key:
-                    found_meta = options[selected_meta_key]
-
-        with st.form("book_details"):
-            f_auth = found_meta.get('authors', '')
-            f_title = found_meta.get('title', '')
-            f_series = found_meta.get('seriesPrimary', '')
-            f_part = found_meta.get('seriesPrimarySequence', '')
-            f_desc = found_meta.get('summary', '')
-            f_img = found_meta.get('image', '')
-            f_narr = found_meta.get('narrators', '')
-            f_year = found_meta.get('releaseDate', '')[:4] if found_meta.get('releaseDate') else ''
-
-            c1, c2 = st.columns(2)
-            with c1:
-                new_author = st.text_input("Author", value=f_auth)
-                new_title = st.text_input("Title", value=f_title)
-                new_narrator = st.text_input("Narrator", value=f_narr)
-            with c2:
-                new_series = st.text_input("Series Name", value=f_series)
-                new_part = st.text_input("Series Part #", value=f_part)
-                new_year = st.text_input("Year", value=f_year)
-            
-            new_desc = st.text_area("Description", value=f_desc, height=150)
-            cover_img = st.text_input("Cover Image URL", value=f_img)
-
-            if cover_img:
-                st.image(cover_img, width=120)
-
-            st.write("---")
-            submitted = st.form_submit_button("🚀 Make Tidy & Import", type="primary")
-            
-            if submitted:
-                if new_author and new_title:
-                    process_book(selected_file_full, new_author, new_title, new_series, new_part, new_desc, cover_img, new_narrator, new_year)
-                else:
-                    st.error("Author and Title are required!")
+            c_search, c_btn = st.columns(
