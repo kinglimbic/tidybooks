@@ -1,4 +1,5 @@
 import streamlit as st
+import pandas as pd  # <--- NEW IMPORT
 import os
 import shutil
 import requests
@@ -14,8 +15,6 @@ LIBRARY_DIR = "/audiobooks"
 DATA_DIR = "/app/data"
 HISTORY_FILE = os.path.join(DATA_DIR, "processed_log.json")
 CACHE_FILE = os.path.join(DATA_DIR, "library_map_cache.json")
-
-# We are switching to Google Books (More reliable than Audnexus)
 GOOGLE_BOOKS_API = "https://www.googleapis.com/books/v1/volumes"
 
 os.makedirs(DATA_DIR, exist_ok=True)
@@ -26,10 +25,9 @@ st.set_page_config(page_title="TidyBooks", layout="wide", page_icon="📚")
 default_keys = ['form_auth', 'form_title', 'form_narr', 'form_series', 'form_part', 'form_year', 'form_desc', 'form_img']
 for key in default_keys:
     if key not in st.session_state: st.session_state[key] = ""
-
-# File Explorer State
 if 'exp_path' not in st.session_state: st.session_state['exp_path'] = DOWNLOAD_DIR
 if 'exp_root' not in st.session_state: st.session_state['exp_root'] = DOWNLOAD_DIR
+if 'sync_selection' not in st.session_state: st.session_state['sync_selection'] = None
 
 # --- Persistence ---
 def load_json(filepath, default=None):
@@ -67,7 +65,7 @@ def clean_search_query(text):
     text = text.replace('.', ' ').replace('_', ' ').replace('-', ' ')
     return re.sub(r'\s+', ' ', text).strip()
 
-# --- Library Scanning ---
+# --- Cached Operations ---
 def scan_library_now():
     library_items = []
     for root, dirs, files in os.walk(LIBRARY_DIR):
@@ -82,14 +80,12 @@ def scan_library_now():
     save_json(CACHE_FILE, library_items)
     return library_items
 
-def get_candidates():
-    history = load_json(HISTORY_FILE, [])
-    cached_lib = load_json(CACHE_FILE, None)
-    library_items = cached_lib if (cached_lib and isinstance(cached_lib, list)) else []
-    
+@st.cache_data(ttl=600, show_spinner="Scanning downloads...")
+def scan_downloads_snapshot():
     if not os.path.exists(DOWNLOAD_DIR): return []
-
-    candidate_map = {} 
+    
+    candidates = []
+    seen_paths = set()
 
     for root, dirs, files in os.walk(DOWNLOAD_DIR):
         audio_files = [f for f in files if f.lower().endswith(('.mp3', '.m4b', '.m4a', '.flac'))]
@@ -109,15 +105,23 @@ def get_candidates():
                      target_path = parent_path
                      target_name = os.path.basename(parent_path)
 
-            if target_path not in candidate_map:
-                candidate_map[target_path] = {
+            if target_path not in seen_paths:
+                seen_paths.add(target_path)
+                candidates.append({
                     "path": target_path,
                     "name": target_name,
                     "clean": sanitize_for_matching(target_name)
-                }
+                })
+    return candidates
 
+def get_candidates_with_status():
+    raw_candidates = scan_downloads_snapshot()
+    history = load_json(HISTORY_FILE, [])
+    cached_lib = load_json(CACHE_FILE, None)
+    library_items = cached_lib if (cached_lib and isinstance(cached_lib, list)) else []
+    
     final_list = []
-    for path, data in candidate_map.items():
+    for data in raw_candidates:
         folder_name = data['name']
         clean_dl = data['clean']
         full_path = data['path']
@@ -139,57 +143,59 @@ def get_candidates():
                         status = 1
                     break
         
-        prefix = ""
-        if status == 3: prefix = "✅ (History) "
-        elif status == 2: prefix = "✅ "
-        elif status == 1: prefix = "🟨 "
+        # We add clean text/emoji for the DataFrame
+        status_icon = "⚪ New"
+        if status == 3: status_icon = "✅ Done"
+        elif status == 2: status_icon = "✅ Library"
+        elif status == 1: status_icon = "🟡 Messy"
         
         final_list.append({
-            "label": f"{prefix}{folder_name}",
             "path": full_path,
-            "type": "dir",
-            "status": status,
+            "name": folder_name,
+            "status_code": status,
+            "Status": status_icon, # For display
             "match_path": match_path,
-            "name": folder_name
         })
 
-    return sorted(final_list, key=lambda x: (1 if x['status'] >= 2 else 0, x['status'] == 2, x['name']))
+    # Sort: White(0) -> Yellow(1) -> Green(2,3)
+    def sort_key(x):
+        s = x['status_code']
+        if s == 0: rank = 0
+        elif s == 1: rank = 1
+        else: rank = 2
+        return (rank, x['name'])
 
-# --- REPLACED: Google Books Search Logic ---
+    return sorted(final_list, key=sort_key)
+
 def fetch_metadata(query):
     try:
         params = {"q": query, "maxResults": 10, "langRestrict": "en"}
         r = requests.get(GOOGLE_BOOKS_API, params=params, timeout=10)
-        
-        # This will FORCE the code to tell us if the network failed
         r.raise_for_status() 
-        
         data = r.json()
         results = []
-        
         for item in data.get('items', []):
             info = item.get('volumeInfo', {})
-            
-            # Google handles images weirdly, try to get HTTPS thumbnail
             img_links = info.get('imageLinks', {})
             img = img_links.get('thumbnail', '') or img_links.get('smallThumbnail', '')
             img = img.replace('http:', 'https:')
 
+            auth_list = info.get('authors', [])
+            primary_author = auth_list[0] if auth_list else ""
+            possible_narrators = ", ".join(auth_list[1:]) if len(auth_list) > 1 else ""
+
             results.append({
                 "title": info.get('title', ''),
-                "authors": ", ".join(info.get('authors', [])),
-                "narrators": "", # Google Books rarely has narrator data
-                "seriesPrimary": "", # Google Books puts series in title often
+                "authors": primary_author,
+                "narrators": possible_narrators, 
+                "seriesPrimary": "", 
                 "seriesPrimarySequence": "",
                 "summary": info.get('description', ''),
                 "image": img,
                 "releaseDate": info.get('publishedDate', '')
             })
-            
         return results
-
     except Exception as e:
-        # VISIBLE ERROR REPORTING
         st.error(f"❌ Connection Error: {e}")
         return []
 
@@ -223,7 +229,8 @@ def tag_file(file_path, author, title, series, desc, cover_url, year, track_num,
 def process_selection(source_data, author, title, series, series_part, desc, cover_url, narrator, publish_year):
     mode = "COPY"
     working_source_path = source_data['path']
-    if source_data['status'] == 1 and source_data['match_path']:
+    # If messy copy exists (status 1), we FIX (Move) instead of Copy
+    if source_data['status_code'] == 1 and source_data['match_path']:
         mode = "FIX"
         working_source_path = source_data['match_path']
 
@@ -276,21 +283,25 @@ def process_selection(source_data, author, title, series, series_part, desc, cov
         save_json(HISTORY_FILE, hist)
     
     st.success(f"✅ Done: {clean_title}")
-    for key in default_keys: st.session_state[key] = ""
+    st.cache_data.clear()
     time.sleep(1)
     st.rerun()
 
 # --- MAIN UI ---
 st.sidebar.title("🛠️ Tools")
 
-# 1. Library Scanner
+if st.sidebar.button("🔄 Refresh Downloads"):
+    st.cache_data.clear()
+    st.success("Cache cleared!")
+    st.rerun()
+
 if st.sidebar.button("📉 Update Library Map"):
     with st.spinner("Scanning library..."):
         scan_library_now()
     st.success("Library updated!")
     st.rerun()
 
-# 2. File Explorer
+# --- FILE EXPLORER with SYNC ---
 st.sidebar.markdown("---")
 with st.sidebar.expander("📂 File System Explorer", expanded=False):
     root_options = {"Downloads": DOWNLOAD_DIR, "Audiobooks": LIBRARY_DIR}
@@ -317,7 +328,9 @@ with st.sidebar.expander("📂 File System Explorer", expanded=False):
             st.markdown("**Folders:**")
             for d in dirs:
                 if st.button(f"📁 {d}", key=f"dir_{d}"):
-                    st.session_state['exp_path'] = os.path.join(current_path, d)
+                    new_path = os.path.join(current_path, d)
+                    st.session_state['exp_path'] = new_path
+                    st.session_state['sync_selection'] = new_path
                     st.rerun()
         if files:
             st.markdown("**Files:**")
@@ -328,22 +341,61 @@ with st.sidebar.expander("📂 File System Explorer", expanded=False):
 # --- MAIN PAGE ---
 col1, col2 = st.columns([1, 2])
 
+# Load Items
+items = get_candidates_with_status()
+
+# Logic to Handle "Sync from Explorer"
+# If the user clicked a folder in Explorer, we try to find it in the list and filter to it
+filtered_items = items
+if st.session_state['sync_selection']:
+    sync_target = st.session_state['sync_selection']
+    # Filter items to only the one that matches
+    matching = [x for x in items if x['path'] == sync_target or sync_target.startswith(x['path'])]
+    if matching:
+        filtered_items = matching
+        st.info(f"📍 Jumped to: {matching[0]['name']}")
+
+# Convert to Pandas for Interactive Table
+df = pd.DataFrame(filtered_items)
+
 with col1:
     st.subheader("📂 Untidy Queue")
-    items = get_candidates()
-    if not items:
+    
+    if df.empty:
         st.info("Queue Empty.")
         selected_item = None
     else:
-        label_map = {f"{x['label']}##{i}": x for i, x in enumerate(items)}
-        key = st.radio("Select Book", list(label_map.keys()), format_func=lambda k: label_map[k]['label'].split('##')[0])
-        selected_item = label_map[key]
+        # Configure the Dataframe
+        selection = st.dataframe(
+            df[['Status', 'name']],
+            column_config={
+                "Status": st.column_config.TextColumn("Status", width="small"),
+                "name": st.column_config.TextColumn("Folder Name"),
+            },
+            use_container_width=True,
+            hide_index=True,
+            on_select="rerun",
+            selection_mode="single-row"
+        )
+        
+        # Get selected row
+        if selection.selection.rows:
+            selected_idx = selection.selection.rows[0]
+            selected_item = filtered_items[selected_idx]
+        else:
+            selected_item = None
 
 with col2:
     if selected_item:
         st.subheader("✏️ Editor")
         st.caption(f"Path: `{selected_item['name']}`")
         
+        # Clear Sync button (if we are in sync mode)
+        if st.session_state['sync_selection']:
+            if st.button("❌ Clear Filter"):
+                st.session_state['sync_selection'] = None
+                st.rerun()
+
         clean_q = clean_search_query(selected_item['name'])
         q = st.text_input("Search", value=clean_q)
         
@@ -391,7 +443,7 @@ with col2:
             if img: st.image(img, width=100)
             
             lbl = "Make Tidy & Import"
-            if selected_item['status'] == 1: lbl = "Fix Structure (Move)"
+            if selected_item['status_code'] == 1: lbl = "Fix Structure (Move)"
             
             if st.form_submit_button(lbl, type="primary"):
                 if auth and titl:
