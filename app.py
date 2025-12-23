@@ -135,7 +135,6 @@ def scan_downloads_snapshot():
                 for stem, file_list in groups.items():
                     unique_id = f"{root}|{stem}"
                     display_name = stem.title()
-                    # Fallback if stem empty
                     if len(display_name) < 2: display_name = folder_name
                     
                     full_paths = [os.path.join(root, f) for f in file_list]
@@ -209,19 +208,20 @@ def calculate_matches(all_candidates, library_items, history):
 def get_candidates_with_status():
     raw_candidates = scan_downloads_snapshot()
     manual_items = st.session_state.get('manual_books', [])
-    
     history = load_json(HISTORY_FILE, [])
     cached_lib = load_json(CACHE_FILE, [])
     if not cached_lib: cached_lib = scan_library_now()
     
-    auto_processed = calculate_matches(raw_candidates, cached_lib, history)
-    manual_processed = calculate_matches(manual_items, cached_lib, history)
-    
-    return auto_processed, manual_processed
+    return calculate_matches(raw_candidates, cached_lib, history), calculate_matches(manual_items, cached_lib, history)
 
 # --- SEARCH ---
 def extract_details_smart(title, desc, subtitle=""):
     narrator, series, part = "", "", ""
+    # Safe handling of None
+    title = title or ""
+    desc = desc or ""
+    subtitle = subtitle or ""
+    
     full_text = f"{title} {subtitle} {desc}"
     
     narr_pat = r"(?:narrated|read)\s+by\s+([A-Za-z\s\.]+?)(?:[\.,\n\(-]|$)"
@@ -236,34 +236,38 @@ def extract_details_smart(title, desc, subtitle=""):
             match_part = re.search(part_pat, full_text, re.IGNORECASE)
             if match_part: part = match_part.group(1)
 
-    series_pat_b = r"\(([^)]+?)(?:,|#|;)\s*(?:Book|Vol|Part)?\s*(\d+)\)"
-    match_series_b = re.search(series_pat_b, title, re.IGNORECASE)
-    if match_series_b:
-        series = match_series_b.group(1).strip()
-        part = match_series_b.group(2).strip()
+    if title:
+        series_pat_b = r"\(([^)]+?)(?:,|#|;)\s*(?:Book|Vol|Part)?\s*(\d+)\)"
+        match_series_b = re.search(series_pat_b, title, re.IGNORECASE)
+        if match_series_b:
+            series = match_series_b.group(1).strip()
+            part = match_series_b.group(2).strip()
+            
     return narrator, series, part
 
 def fetch_audnexus_direct(asin):
-    """Direct ASIN lookup - Guaranteed to work if ASIN is valid"""
     if not asin: return []
-    try:
-        # User-Agent is critical
-        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/91.0.4472.124 Safari/537.36'}
-        r = requests.get(f"{AUDNEXUS_API}/{asin}", headers=headers, timeout=10)
-        if r.status_code == 200:
-            b = r.json()
-            return [{
-                "title": b.get('title'),
-                "authors": ", ".join(b.get('authors', [])),
-                "narrators": ", ".join(b.get('narrators', [])),
-                "series": b.get('seriesPrimary', ''),
-                "part": b.get('seriesPrimarySequence', ''),
-                "summary": b.get('summary', ''),
-                "image": b.get('image', ''),
-                "releaseDate": b.get('releaseDate', ''),
-                "source": "Audible (ASIN)"
-            }]
-    except: pass
+    headers_list = [
+        {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/91.0.4472.124 Safari/537.36'},
+        {'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/14.0 Safari/605.1.15'}
+    ]
+    for headers in headers_list:
+        try:
+            r = requests.get(f"{AUDNEXUS_API}/{asin}", headers=headers, timeout=10)
+            if r.status_code == 200:
+                b = r.json()
+                return [{
+                    "title": b.get('title') or "",
+                    "authors": ", ".join(b.get('authors', [])) or "",
+                    "narrators": ", ".join(b.get('narrators', [])) or "",
+                    "series": b.get('seriesPrimary') or "",
+                    "part": b.get('seriesPrimarySequence') or "",
+                    "summary": b.get('summary') or "",
+                    "image": b.get('image') or "",
+                    "releaseDate": b.get('releaseDate') or "",
+                    "source": f"Audible ({asin})"
+                }]
+        except: pass
     return []
 
 def fetch_itunes(query):
@@ -273,13 +277,13 @@ def fetch_itunes(query):
             results = []
             for item in r.json().get('results', []):
                 img = item.get('artworkUrl100', '').replace('100x100', '600x600')
-                raw_title = item.get('collectionName', '')
-                raw_desc = item.get('description', '')
+                raw_title = item.get('collectionName') or ""
+                raw_desc = item.get('description') or ""
                 s_narr, s_ser, s_part = extract_details_smart(raw_title, raw_desc)
                 results.append({
-                    "title": raw_title, "authors": item.get('artistName'),
+                    "title": raw_title, "authors": item.get('artistName') or "",
                     "narrators": s_narr, "series": s_ser, "part": s_part, 
-                    "summary": raw_desc, "image": img, "releaseDate": item.get('releaseDate', '')
+                    "summary": raw_desc, "image": img, "releaseDate": item.get('releaseDate') or ""
                 })
             return results
     except: pass
@@ -292,13 +296,17 @@ def fetch_google(query):
             results = []
             for item in r.json().get('items', []):
                 info = item.get('volumeInfo', {})
-                img = info.get('imageLinks', {}).get('thumbnail', '').replace('http:', 'https:')
-                auths = info.get('authors', [])
-                s_narr, s_ser, s_part = extract_details_smart(info.get('title', ''), info.get('description', ''), info.get('subtitle', ''))
+                img_links = info.get('imageLinks') or {}
+                img = img_links.get('thumbnail', '').replace('http:', 'https:')
+                auths = info.get('authors') or []
+                raw_title = info.get('title') or ""
+                raw_subtitle = info.get('subtitle') or ""
+                raw_desc = info.get('description') or ""
+                s_narr, s_ser, s_part = extract_details_smart(raw_title, raw_desc, raw_subtitle)
                 results.append({
-                    "title": info.get('title'), "authors": auths[0] if auths else "",
+                    "title": raw_title, "authors": auths[0] if auths else "",
                     "narrators": s_narr, "series": s_ser, "part": s_part, 
-                    "summary": info.get('description', ''), "image": img, "releaseDate": info.get('publishedDate', '')
+                    "summary": raw_desc, "image": img, "releaseDate": info.get('publishedDate') or ""
                 })
             return results
     except: pass
@@ -347,7 +355,9 @@ def process_selection(source_data, author, title, series, series_part, desc, cov
                 file_path = os.path.join(dest_base, filename)
                 if os.path.isfile(file_path) or os.path.islink(file_path): os.unlink(file_path)
                 elif os.path.isdir(file_path): shutil.rmtree(file_path)
-        except: pass
+        except Exception as e:
+            st.error(f"Error cleaning destination: {e}")
+            return # Stop to be safe
     else:
         clean_author = sanitize_filename(author)
         clean_title = sanitize_filename(title)
@@ -364,7 +374,10 @@ def process_selection(source_data, author, title, series, series_part, desc, cov
         ext = os.path.splitext(src)[1]
         name = f"{str(i+1).zfill(pad)} - {sanitize_filename(title)}{ext}"
         dst = os.path.join(dest_base, name)
+        
+        # ALWAYS COPY, NEVER MOVE
         shutil.copy2(src, dst)
+            
         tag_file(dst, author, title, series, desc, cover_url, publish_year, i+1, total)
         bar.progress((i+1)/total)
 
@@ -398,13 +411,12 @@ col1, col2, col3 = st.columns([1.5, 2, 1.5])
 
 # Fetch Data
 auto_processed, manual_processed = get_candidates_with_status()
-
 new_items = [x for x in auto_processed if x['status_code'] == 0]
 match_items = [x for x in auto_processed if x['status_code'] == 1]
 existing_items = [x for x in auto_processed if x['status_code'] == 3]
 built_items = [x for x in manual_processed]
 
-# Sync
+# Sync: Explorer -> Queue
 if st.session_state['sync_selection']:
     sync_target = st.session_state['sync_selection']
     all_known = auto_processed + manual_processed
@@ -448,11 +460,11 @@ with col1:
         if not new_items: st.info("Empty")
         else:
             df = pd.DataFrame(new_items)
-            sel = st.dataframe(
+            sel = st.data_editor(
                 df[['name']], column_config={"name": "Folder Name"},
                 use_container_width=True, hide_index=True, height=600,
                 on_select=lambda: on_grid_select('untidy'), selection_mode="single-row",
-                key=f"grid_auto_{st.session_state['grid_key_auto']}"
+                key=f"grid_auto_{st.session_state['grid_key_auto']}", disabled=True
             )
             if sel.selection.rows: st.session_state['current_selection_data'] = new_items[sel.selection.rows[0]]
 
@@ -460,11 +472,11 @@ with col1:
         if not built_items: st.info("Use Explorer to bundle.")
         else:
             df = pd.DataFrame(built_items)
-            sel = st.dataframe(
+            sel = st.data_editor(
                 df[['name']], column_config={"name": "Bundle Name"},
                 use_container_width=True, hide_index=True, height=600,
                 on_select=lambda: on_grid_select('built'), selection_mode="single-row",
-                key=f"grid_manual_{st.session_state['grid_key_manual']}"
+                key=f"grid_manual_{st.session_state['grid_key_manual']}", disabled=True
             )
             if sel.selection.rows: st.session_state['current_selection_data'] = built_items[sel.selection.rows[0]]
 
@@ -472,11 +484,11 @@ with col1:
         if not match_items: st.info("No duplicates.")
         else:
             df = pd.DataFrame(match_items)
-            sel = st.dataframe(
+            sel = st.data_editor(
                 df[['name']], column_config={"name": "Matches"},
                 use_container_width=True, hide_index=True, height=600,
                 on_select=lambda: on_grid_select('match'), selection_mode="single-row",
-                key=f"grid_match_{st.session_state['grid_key_match']}"
+                key=f"grid_match_{st.session_state['grid_key_match']}", disabled=True
             )
             if sel.selection.rows: st.session_state['current_selection_data'] = match_items[sel.selection.rows[0]]
 
@@ -484,11 +496,11 @@ with col1:
         if not existing_items: st.info("Empty.")
         else:
             df = pd.DataFrame(existing_items)
-            sel = st.dataframe(
+            sel = st.data_editor(
                 df[['name']], column_config={"name": "History"},
                 use_container_width=True, hide_index=True, height=600,
                 on_select=lambda: on_grid_select('done'), selection_mode="single-row",
-                key=f"grid_done_{st.session_state['grid_key_done']}"
+                key=f"grid_done_{st.session_state['grid_key_done']}", disabled=True
             )
             if sel.selection.rows: st.session_state['current_selection_data'] = existing_items[sel.selection.rows[0]]
 
@@ -508,7 +520,7 @@ with col2:
         st.subheader("✏️ Editor")
         
         if selected_item['status_code'] == 1:
-            st.warning("⚠️ Match Found")
+            st.warning("⚠️ Match Found in Library")
             st.code(f"Target: {os.path.basename(selected_item['match_path'])}", language="text")
             target_override = selected_item['match_path']
         else:
@@ -519,50 +531,55 @@ with col2:
             st.session_state['current_selection_data'] = None
             st.rerun()
             
-        c_src, c_bar, c_btn = st.columns([1, 2, 1])
-        with c_src: provider = st.selectbox("Source", ["Apple Books", "Google Books"], key='search_provider', label_visibility="collapsed")
-        with c_bar: 
-            clean_q = clean_search_query(selected_item['name'])
-            q = st.text_input("Search", value=clean_q, label_visibility="collapsed")
-        with c_btn: do_search = st.button("Search")
+        clean_q = clean_search_query(selected_item['name'])
+        q = st.text_input("Search", value=clean_q)
         
-        # --- NEW: DIRECT ASIN INPUT ---
-        asin_input = st.text_input("Or enter Audible ASIN (e.g. B01N2K4S)", placeholder="Direct ID Lookup (Reliable)")
+        c_p, c_a = st.columns([1, 2])
+        with c_p: provider = st.selectbox("Source", ["Apple Books", "Google Books"])
+        with c_a: asin_input = st.text_input("Or Audible ASIN", placeholder="e.g. B01N...")
+        
+        do_search = st.button("Search")
 
-        def update_form_state():
-            if 'result_selector' in st.session_state and 'search_results' in st.session_state:
-                opts = {f"{b.get('authors')} - {b.get('title')}": b for b in st.session_state['search_results']}
-                sel_key = st.session_state['result_selector']
-                if sel_key in opts:
-                    data = opts[sel_key]
-                    st.session_state['form_auth'] = data.get('authors', '')
-                    st.session_state['form_title'] = data.get('title', '')
-                    st.session_state['form_narr'] = data.get('narrators', '')
-                    st.session_state['form_series'] = data.get('series', '')
-                    st.session_state['form_part'] = data.get('part', '')
-                    rd = data.get('releaseDate')
-                    st.session_state['form_year'] = rd
+        # Function to force update session state from results
+        def force_update_form(idx):
+            if 'search_results' in st.session_state:
+                try:
+                    data = st.session_state['search_results'][idx]
+                    st.session_state['form_auth'] = data.get('authors') or ''
+                    st.session_state['form_title'] = data.get('title') or ''
+                    st.session_state['form_narr'] = data.get('narrators') or ''
+                    st.session_state['form_series'] = data.get('series') or ''
+                    st.session_state['form_part'] = data.get('part') or ''
+                    rd = data.get('releaseDate') or ''
+                    st.session_state['form_year'] = rd[:4] if len(rd) >= 4 else rd
+                    st.session_state['form_desc'] = data.get('summary') or ''
+                    st.session_state['form_img'] = data.get('image') or ''
+                except: pass
 
-        # Logic for Search vs ASIN
         if do_search or asin_input:
             with st.spinner(f"Searching..."):
                 if asin_input:
-                    # Direct ASIN Mode
                     res = fetch_metadata_router(q, "Audible", asin_input.strip())
                 else:
-                    # Standard Text Search
                     res = fetch_metadata_router(q, provider)
                 
                 if res:
                     st.session_state['search_results'] = res
-                    first = f"{res[0].get('authors')} - {res[0].get('title')}"
-                    st.session_state['result_selector'] = first
-                    update_form_state()
+                    # Auto-select first result
+                    force_update_form(0)
                 else: st.warning(f"No matches.")
 
         if 'search_results' in st.session_state:
             opts = [f"{b.get('authors')} - {b.get('title')}" for b in st.session_state['search_results']]
-            if opts: st.selectbox("Results", opts, key='result_selector', on_change=update_form_state)
+            # Use Index to drive selection to avoid text key errors
+            sel_idx = st.selectbox("Results", range(len(opts)), format_func=lambda x: opts[x])
+            # Force update on selection change
+            force_update_form(sel_idx)
+
+        # Raw Data Inspector (Debug)
+        with st.expander("🔍 Show Raw Data (Debug)"):
+            if 'search_results' in st.session_state:
+                st.json(st.session_state['search_results'])
 
         with st.form("main"):
             c1, c2 = st.columns(2)
