@@ -4,8 +4,7 @@ services:
     build: .
     container_name: tidybooks  
     ports:
-      - "8502:8501"
-    network_mode: host    
+      - "8502:8501" 
     volumes:
       - /volume1/Zack/media/downloads/Audiobooks - MAM - Seeding:/downloads:ro
       - /volume1/Zack/media/audiobooks:/audiobooks:rw
@@ -13,5 +12,8 @@ services:
     environment:
       - PUID=0
       - PGID=0
+    dns:
+      - 8.8.8.8
+      - 1.1.1.1
     command: streamlit run app.py --server.port=8502 --server.address=0.0.0.0
     restart: unless-stopped
