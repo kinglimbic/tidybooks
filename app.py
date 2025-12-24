@@ -245,12 +245,10 @@ def extract_details_smart(title, desc, subtitle=""):
 
 def fetch_audnexus_direct(asin):
     if not asin: return []
-    # Try different headers
     headers_list = [
         {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/91.0.4472.124 Safari/537.36'},
         {'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/14.0 Safari/605.1.15'}
     ]
-    
     for headers in headers_list:
         try:
             r = requests.get(f"{AUDNEXUS_API}/{asin}", headers=headers, timeout=10)
@@ -267,10 +265,7 @@ def fetch_audnexus_direct(asin):
                     "releaseDate": b.get('releaseDate') or "",
                     "source": f"Audible ({asin})"
                 }]
-            else:
-                st.toast(f"Audnexus Error: {r.status_code}")
-        except Exception as e:
-            st.toast(f"Connection Failed: {e}")
+        except: pass
     return []
 
 def fetch_itunes(query):
@@ -315,6 +310,11 @@ def fetch_google(query):
     except: pass
     return []
 
+def fetch_metadata_router(query, provider, asin=None):
+    if asin: return fetch_audnexus_direct(asin)
+    if provider == "Apple Books": return fetch_itunes(query)
+    return fetch_google(query)
+
 # --- PROCESSING ---
 def tag_file(file_path, author, title, series, desc, cover_url, year, track_num, total_tracks):
     ext = os.path.splitext(file_path)[1].lower()
@@ -355,7 +355,7 @@ def process_selection(source_data, author, title, series, series_part, desc, cov
                 elif os.path.isdir(file_path): shutil.rmtree(file_path)
         except Exception as e:
             st.error(f"Error cleaning destination: {e}")
-            return
+            return # Stop to be safe
     else:
         clean_author = sanitize_filename(author)
         clean_title = sanitize_filename(title)
@@ -372,7 +372,10 @@ def process_selection(source_data, author, title, series, series_part, desc, cov
         ext = os.path.splitext(src)[1]
         name = f"{str(i+1).zfill(pad)} - {sanitize_filename(title)}{ext}"
         dst = os.path.join(dest_base, name)
+        
+        # ALWAYS COPY, NEVER MOVE
         shutil.copy2(src, dst)
+            
         tag_file(dst, author, title, series, desc, cover_url, publish_year, i+1, total)
         bar.progress((i+1)/total)
 
@@ -429,75 +432,36 @@ if st.session_state['sync_selection']:
         st.toast(f"Matched: {matching[0]['name']}")
         st.session_state['sync_selection'] = None
 
-# --- COL 1 ---
+# --- COL 1: QUEUE (COMPATIBILITY MODE) ---
+# We use standard Checkbox + Text display to avoid version errors
+def render_list(items, key_suffix):
+    if not items:
+        st.info("Empty")
+        return
+    
+    # Simple list of checkboxes to select items
+    # Ensure only ONE is selected at a time by clearing state on change
+    for i, item in enumerate(items):
+        label = f"{item['State']} {item['name']}"
+        # We manually handle mutual exclusivity
+        is_selected = (st.session_state.get('current_selection_data') == item)
+        
+        if st.checkbox(label, key=f"chk_{key_suffix}_{i}", value=is_selected):
+            if not is_selected:
+                st.session_state['current_selection_data'] = item
+                st.rerun()
+        elif is_selected:
+            # Deselect if unchecked
+            st.session_state['current_selection_data'] = None
+            st.rerun()
+
 with col1:
     tab_new, tab_built, tab_match, tab_exist = st.tabs(["🆕 Untidy", "🛠️ Built", "⚠️ Match", "📚 Done"])
     
-    def on_grid_select(grid_name):
-        if grid_name == 'untidy': 
-            st.session_state['grid_key_manual'] += 1
-            st.session_state['grid_key_match'] += 1
-            st.session_state['grid_key_done'] += 1
-        elif grid_name == 'built':
-            st.session_state['grid_key_auto'] += 1
-            st.session_state['grid_key_match'] += 1
-            st.session_state['grid_key_done'] += 1
-        elif grid_name == 'match':
-            st.session_state['grid_key_auto'] += 1
-            st.session_state['grid_key_manual'] += 1
-            st.session_state['grid_key_done'] += 1
-        elif grid_name == 'done':
-            st.session_state['grid_key_auto'] += 1
-            st.session_state['grid_key_manual'] += 1
-            st.session_state['grid_key_match'] += 1
-
-    with tab_new:
-        if not new_items: st.info("Empty")
-        else:
-            df = pd.DataFrame(new_items)
-            sel = st.data_editor(
-                df[['name']], column_config={"name": "Folder Name"},
-                use_container_width=True, hide_index=True, height=600,
-                on_select=lambda: on_grid_select('untidy'), selection_mode="single-row",
-                key=f"grid_auto_{st.session_state['grid_key_auto']}", disabled=True
-            )
-            if sel.selection.rows: st.session_state['current_selection_data'] = new_items[sel.selection.rows[0]]
-
-    with tab_built:
-        if not built_items: st.info("Use Explorer to bundle.")
-        else:
-            df = pd.DataFrame(built_items)
-            sel = st.data_editor(
-                df[['name']], column_config={"name": "Bundle Name"},
-                use_container_width=True, hide_index=True, height=600,
-                on_select=lambda: on_grid_select('built'), selection_mode="single-row",
-                key=f"grid_manual_{st.session_state['grid_key_manual']}", disabled=True
-            )
-            if sel.selection.rows: st.session_state['current_selection_data'] = built_items[sel.selection.rows[0]]
-
-    with tab_match:
-        if not match_items: st.info("No duplicates.")
-        else:
-            df = pd.DataFrame(match_items)
-            sel = st.data_editor(
-                df[['name']], column_config={"name": "Matches"},
-                use_container_width=True, hide_index=True, height=600,
-                on_select=lambda: on_grid_select('match'), selection_mode="single-row",
-                key=f"grid_match_{st.session_state['grid_key_match']}", disabled=True
-            )
-            if sel.selection.rows: st.session_state['current_selection_data'] = match_items[sel.selection.rows[0]]
-
-    with tab_exist:
-        if not existing_items: st.info("Empty.")
-        else:
-            df = pd.DataFrame(existing_items)
-            sel = st.data_editor(
-                df[['name']], column_config={"name": "History"},
-                use_container_width=True, hide_index=True, height=600,
-                on_select=lambda: on_grid_select('done'), selection_mode="single-row",
-                key=f"grid_done_{st.session_state['grid_key_done']}", disabled=True
-            )
-            if sel.selection.rows: st.session_state['current_selection_data'] = existing_items[sel.selection.rows[0]]
+    with tab_new: render_list(new_items, "new")
+    with tab_built: render_list(built_items, "built")
+    with tab_match: render_list(match_items, "match")
+    with tab_exist: render_list(existing_items, "done")
 
 # Sync: Queue -> Explorer
 selected_item = st.session_state.get('current_selection_data')
@@ -522,27 +486,18 @@ with col2:
             st.caption(f"Path: `{os.path.basename(selected_item['path'])}`")
             target_override = None
 
-        if st.button("❌ Close"):
+        if st.button("❌ Close Selection"):
             st.session_state['current_selection_data'] = None
             st.rerun()
             
         clean_q = clean_search_query(selected_item['name'])
-        q_text = st.text_input("Title Search", value=clean_q)
+        q = st.text_input("Search", value=clean_q)
         
-        c_p, c_btn = st.columns([2, 1])
-        with c_p: provider = st.selectbox("Provider", ["Apple Books", "Google Books"])
-        with c_btn: 
-            st.write("")
-            do_text_search = st.button("🔍 Search Text")
-
-        st.markdown("---")
-        # ASIN Search
-        c_asin, c_abtn = st.columns([2, 1])
-        with c_asin:
-            asin_val = st.text_input("Audible ASIN (ID)", placeholder="B0...")
-        with c_abtn:
-            st.write("")
-            do_asin_search = st.button("🆔 Lookup ID")
+        c_p, c_a = st.columns([1, 2])
+        with c_p: provider = st.selectbox("Source", ["Apple Books", "Google Books"])
+        with c_a: asin_input = st.text_input("Or Audible ASIN", placeholder="e.g. B01N...")
+        
+        do_search = st.button("Search")
 
         # Function to force update session state from results
         def force_update_form(idx):
@@ -560,22 +515,17 @@ with col2:
                     st.session_state['form_img'] = data.get('image') or ''
                 except: pass
 
-        # Logic Split
-        if do_asin_search and asin_val:
-             with st.spinner(f"Fetching ASIN..."):
-                res = fetch_metadata_router(None, "Audible", asin_val.strip())
+        if do_search or asin_input:
+            with st.spinner(f"Searching..."):
+                if asin_input:
+                    res = fetch_metadata_router(q, "Audible", asin_input.strip())
+                else:
+                    res = fetch_metadata_router(q, provider)
+                
                 if res:
                     st.session_state['search_results'] = res
                     force_update_form(0)
-                else: st.warning(f"ASIN Not Found.")
-        
-        elif do_text_search:
-             with st.spinner(f"Searching {provider}..."):
-                res = fetch_metadata_router(q_text, provider)
-                if res:
-                    st.session_state['search_results'] = res
-                    force_update_form(0)
-                else: st.warning(f"No text matches.")
+                else: st.warning(f"No matches.")
 
         if 'search_results' in st.session_state:
             opts = [f"{b.get('authors')} - {b.get('title')}" for b in st.session_state['search_results']]
@@ -631,6 +581,8 @@ with col3:
         
         if file_list:
             df_files = pd.DataFrame(file_list)
+            # Use Multi-Row so user can check files to bundle
+            # Standard Dataframe for explorer (Multi-select works fine here without on_select)
             sel_files = st.dataframe(
                 df_files[['icon', 'name']],
                 column_config={"icon": st.column_config.TextColumn("", width="small")},
