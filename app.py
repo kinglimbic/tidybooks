@@ -75,6 +75,7 @@ def is_junk_folder(folder_name):
     return folder_name.lower() in junk
 
 def clean_search_query(text):
+    if not text: return ""
     text = re.sub(r'[\(\[\{].*?[\)\]\}]', '', text)
     text = re.sub(r'\b(mp3|m4b|128k|64k|192k|aac)\b', '', text, flags=re.IGNORECASE)
     text = re.sub(r'\b(cd|disc|part|vol|v)\s*\d+\b', '', text, flags=re.IGNORECASE)
@@ -217,9 +218,11 @@ def get_candidates_with_status():
 # --- SEARCH ---
 def extract_details_smart(title, desc, subtitle=""):
     narrator, series, part = "", "", ""
-    title = title or ""
-    desc = desc or ""
-    subtitle = subtitle or ""
+    # Ensure strings
+    title = title if title else ""
+    desc = desc if desc else ""
+    subtitle = subtitle if subtitle else ""
+    
     full_text = f"{title} {subtitle} {desc}"
     
     narr_pat = r"(?:narrated|read)\s+by\s+([A-Za-z\s\.]+?)(?:[\.,\n\(-]|$)"
@@ -245,54 +248,64 @@ def extract_details_smart(title, desc, subtitle=""):
 
 def fetch_audnexus_direct(asin):
     if not asin: return []
-    headers_list = [
-        {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/91.0.4472.124 Safari/537.36'},
-        {'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/14.0 Safari/605.1.15'}
-    ]
-    for headers in headers_list:
-        try:
-            r = requests.get(f"{AUDNEXUS_API}/{asin}", headers=headers, timeout=10)
-            if r.status_code == 200:
-                b = r.json()
-                return [{
-                    "title": b.get('title') or "",
-                    "authors": ", ".join(b.get('authors', [])) or "",
-                    "narrators": ", ".join(b.get('narrators', [])) or "",
-                    "series": b.get('seriesPrimary') or "",
-                    "part": b.get('seriesPrimarySequence') or "",
-                    "summary": b.get('summary') or "",
-                    "image": b.get('image') or "",
-                    "releaseDate": b.get('releaseDate') or "",
-                    "source": f"Audible ({asin})"
-                }]
-        except: pass
+    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/91.0.4472.124 Safari/537.36'}
+    try:
+        r = requests.get(f"{AUDNEXUS_API}/{asin}", headers=headers, timeout=10)
+        if r.status_code == 200:
+            b = r.json()
+            return [{
+                "title": b.get('title') or "",
+                "authors": ", ".join(b.get('authors', [])) or "",
+                "narrators": ", ".join(b.get('narrators', [])) or "",
+                "series": b.get('seriesPrimary') or "",
+                "part": b.get('seriesPrimarySequence') or "",
+                "summary": b.get('summary') or "",
+                "image": b.get('image') or "",
+                "releaseDate": b.get('releaseDate') or "",
+                "source": f"Audible ({asin})"
+            }]
+        else:
+            st.error(f"Audnexus Error: {r.status_code}")
+    except Exception as e:
+        st.error(f"Audnexus Connection Error: {e}")
     return []
 
 def fetch_itunes(query):
     try:
-        r = requests.get(ITUNES_API, params={'term': query, 'media': 'audiobook', 'limit': 10}, timeout=5)
+        r = requests.get(ITUNES_API, params={'term': query, 'media': 'audiobook', 'limit': 10}, timeout=10)
         if r.status_code == 200:
+            data = r.json()
             results = []
-            for item in r.json().get('results', []):
+            for item in data.get('results', []):
                 img = item.get('artworkUrl100', '').replace('100x100', '600x600')
                 raw_title = item.get('collectionName') or ""
                 raw_desc = item.get('description') or ""
                 s_narr, s_ser, s_part = extract_details_smart(raw_title, raw_desc)
+                
                 results.append({
-                    "title": raw_title, "authors": item.get('artistName') or "",
-                    "narrators": s_narr, "series": s_ser, "part": s_part, 
-                    "summary": raw_desc, "image": img, "releaseDate": item.get('releaseDate') or ""
+                    "title": raw_title, 
+                    "authors": item.get('artistName') or "",
+                    "narrators": s_narr, 
+                    "series": s_ser, 
+                    "part": s_part, 
+                    "summary": raw_desc, 
+                    "image": img, 
+                    "releaseDate": item.get('releaseDate') or ""
                 })
             return results
-    except: pass
+        else:
+            st.error(f"Apple Books Error: {r.status_code}")
+    except Exception as e:
+        st.error(f"Apple Books Connection Error: {e}")
     return []
 
 def fetch_google(query):
     try:
-        r = requests.get(GOOGLE_BOOKS_API, params={"q": query, "maxResults": 10, "langRestrict": "en"}, timeout=5)
+        r = requests.get(GOOGLE_BOOKS_API, params={"q": query, "maxResults": 10, "langRestrict": "en"}, timeout=10)
         if r.status_code == 200:
+            data = r.json()
             results = []
-            for item in r.json().get('items', []):
+            for item in data.get('items', []):
                 info = item.get('volumeInfo', {})
                 img_links = info.get('imageLinks') or {}
                 img = img_links.get('thumbnail', '').replace('http:', 'https:')
@@ -301,13 +314,22 @@ def fetch_google(query):
                 raw_subtitle = info.get('subtitle') or ""
                 raw_desc = info.get('description') or ""
                 s_narr, s_ser, s_part = extract_details_smart(raw_title, raw_desc, raw_subtitle)
+                
                 results.append({
-                    "title": raw_title, "authors": auths[0] if auths else "",
-                    "narrators": s_narr, "series": s_ser, "part": s_part, 
-                    "summary": raw_desc, "image": img, "releaseDate": info.get('publishedDate') or ""
+                    "title": raw_title, 
+                    "authors": auths[0] if auths else "",
+                    "narrators": s_narr, 
+                    "series": s_ser, 
+                    "part": s_part, 
+                    "summary": raw_desc, 
+                    "image": img, 
+                    "releaseDate": info.get('publishedDate') or ""
                 })
             return results
-    except: pass
+        else:
+            st.error(f"Google Books Error: {r.status_code}")
+    except Exception as e:
+        st.error(f"Google Books Connection Error: {e}")
     return []
 
 def fetch_metadata_router(query, provider, asin=None):
@@ -353,9 +375,7 @@ def process_selection(source_data, author, title, series, series_part, desc, cov
                 file_path = os.path.join(dest_base, filename)
                 if os.path.isfile(file_path) or os.path.islink(file_path): os.unlink(file_path)
                 elif os.path.isdir(file_path): shutil.rmtree(file_path)
-        except Exception as e:
-            st.error(f"Error cleaning destination: {e}")
-            return # Stop to be safe
+        except: pass
     else:
         clean_author = sanitize_filename(author)
         clean_title = sanitize_filename(title)
@@ -373,7 +393,6 @@ def process_selection(source_data, author, title, series, series_part, desc, cov
         name = f"{str(i+1).zfill(pad)} - {sanitize_filename(title)}{ext}"
         dst = os.path.join(dest_base, name)
         
-        # ALWAYS COPY, NEVER MOVE
         shutil.copy2(src, dst)
             
         tag_file(dst, author, title, series, desc, cover_url, publish_year, i+1, total)
@@ -421,43 +440,28 @@ if st.session_state['sync_selection']:
     matching = [x for x in all_known if x['path'] == sync_target or sync_target.startswith(x['path'])]
     if matching:
         st.session_state['current_selection_data'] = matching[0]
-        if matching[0] in manual_processed:
-            st.session_state['grid_key_auto'] += 1
-            st.session_state['grid_key_match'] += 1
-            st.session_state['grid_key_done'] += 1
-        else:
-            st.session_state['grid_key_manual'] += 1
-            st.session_state['grid_key_match'] += 1
-            st.session_state['grid_key_done'] += 1
         st.toast(f"Matched: {matching[0]['name']}")
         st.session_state['sync_selection'] = None
 
 # --- COL 1: QUEUE (COMPATIBILITY MODE) ---
-# We use standard Checkbox + Text display to avoid version errors
 def render_list(items, key_suffix):
     if not items:
         st.info("Empty")
         return
     
-    # Simple list of checkboxes to select items
-    # Ensure only ONE is selected at a time by clearing state on change
     for i, item in enumerate(items):
-        label = f"{item['State']} {item['name']}"
-        # We manually handle mutual exclusivity
         is_selected = (st.session_state.get('current_selection_data') == item)
-        
-        if st.checkbox(label, key=f"chk_{key_suffix}_{i}", value=is_selected):
+        # Use simple Checkbox to select
+        if st.checkbox(f"{item['State']} {item['name']}", key=f"chk_{key_suffix}_{i}", value=is_selected):
             if not is_selected:
                 st.session_state['current_selection_data'] = item
                 st.rerun()
         elif is_selected:
-            # Deselect if unchecked
             st.session_state['current_selection_data'] = None
             st.rerun()
 
 with col1:
     tab_new, tab_built, tab_match, tab_exist = st.tabs(["🆕 Untidy", "🛠️ Built", "⚠️ Match", "📚 Done"])
-    
     with tab_new: render_list(new_items, "new")
     with tab_built: render_list(built_items, "built")
     with tab_match: render_list(match_items, "match")
@@ -499,7 +503,6 @@ with col2:
         
         do_search = st.button("Search")
 
-        # Function to force update session state from results
         def force_update_form(idx):
             if 'search_results' in st.session_state:
                 try:
@@ -517,6 +520,7 @@ with col2:
 
         if do_search or asin_input:
             with st.spinner(f"Searching..."):
+                st.session_state['search_results'] = []
                 if asin_input:
                     res = fetch_metadata_router(q, "Audible", asin_input.strip())
                 else:
@@ -527,12 +531,12 @@ with col2:
                     force_update_form(0)
                 else: st.warning(f"No matches.")
 
-        if 'search_results' in st.session_state:
+        if 'search_results' in st.session_state and st.session_state['search_results']:
             opts = [f"{b.get('authors')} - {b.get('title')}" for b in st.session_state['search_results']]
             sel_idx = st.selectbox("Results", range(len(opts)), format_func=lambda x: opts[x])
             force_update_form(sel_idx)
 
-        # Raw Data Inspector (Debug)
+        # DEBUG: Show what API returned
         with st.expander("🔍 Show Raw Data"):
             if 'search_results' in st.session_state:
                 st.json(st.session_state['search_results'])
@@ -581,8 +585,6 @@ with col3:
         
         if file_list:
             df_files = pd.DataFrame(file_list)
-            # Use Multi-Row so user can check files to bundle
-            # Standard Dataframe for explorer (Multi-select works fine here without on_select)
             sel_files = st.dataframe(
                 df_files[['icon', 'name']],
                 column_config={"icon": st.column_config.TextColumn("", width="small")},
