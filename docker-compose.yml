@@ -11,5 +11,5 @@ services:
       - /volume1/Zack/media:/data
       
       # Keep config separate
-      - ./data:/app/data
+      - /volume2/docker/tidybooks:/app/data
     restart: unless-stopped
