@@ -10,9 +10,10 @@ from mutagen.mp4 import MP4, MP4Cover
 from mutagen.id3 import ID3, TIT2, TPE1, TALB, APIC, COMM, TRCK
 import difflib
 
-# --- Configuration ---
-DOWNLOAD_DIR = "/downloads"
-LIBRARY_DIR = "/audiobooks"
+# --- Configuration (UPDATED FOR HARDLINKS) ---
+# We now look inside '/data' so both folders are on the same filesystem.
+DOWNLOAD_DIR = "/data/downloads"   # Was /downloads
+LIBRARY_DIR = "/data/audiobooks"   # Was /audiobooks
 DATA_DIR = "/app/data"
 HISTORY_FILE = os.path.join(DATA_DIR, "processed_log.json")
 CACHE_FILE = os.path.join(DATA_DIR, "library_map_cache.json")
@@ -96,6 +97,9 @@ def natural_keys(text):
 # --- Cached Operations ---
 def scan_library_now():
     library_items = []
+    # Ensure dir exists to avoid crash on first run
+    if not os.path.exists(LIBRARY_DIR): return []
+    
     for root, dirs, files in os.walk(LIBRARY_DIR):
         has_audio = any(f.lower().endswith(('.mp3', '.m4b', '.m4a', '.flac')) for f in files)
         if has_audio:
@@ -218,11 +222,9 @@ def get_candidates_with_status():
 # --- SEARCH ---
 def extract_details_smart(title, desc, subtitle=""):
     narrator, series, part = "", "", ""
-    # Ensure strings
-    title = title if title else ""
-    desc = desc if desc else ""
-    subtitle = subtitle if subtitle else ""
-    
+    title = title or ""
+    desc = desc or ""
+    subtitle = subtitle or ""
     full_text = f"{title} {subtitle} {desc}"
     
     narr_pat = r"(?:narrated|read)\s+by\s+([A-Za-z\s\.]+?)(?:[\.,\n\(-]|$)"
@@ -281,22 +283,14 @@ def fetch_itunes(query):
                 raw_title = item.get('collectionName') or ""
                 raw_desc = item.get('description') or ""
                 s_narr, s_ser, s_part = extract_details_smart(raw_title, raw_desc)
-                
                 results.append({
-                    "title": raw_title, 
-                    "authors": item.get('artistName') or "",
-                    "narrators": s_narr, 
-                    "series": s_ser, 
-                    "part": s_part, 
-                    "summary": raw_desc, 
-                    "image": img, 
-                    "releaseDate": item.get('releaseDate') or ""
+                    "title": raw_title, "authors": item.get('artistName') or "",
+                    "narrators": s_narr, "series": s_ser, "part": s_part, 
+                    "summary": raw_desc, "image": img, "releaseDate": item.get('releaseDate') or ""
                 })
             return results
-        else:
-            st.error(f"Apple Books Error: {r.status_code}")
-    except Exception as e:
-        st.error(f"Apple Books Connection Error: {e}")
+        else: st.error(f"Apple Error: {r.status_code}")
+    except Exception as e: st.error(f"Apple Connection Error: {e}")
     return []
 
 def fetch_google(query):
@@ -314,22 +308,14 @@ def fetch_google(query):
                 raw_subtitle = info.get('subtitle') or ""
                 raw_desc = info.get('description') or ""
                 s_narr, s_ser, s_part = extract_details_smart(raw_title, raw_desc, raw_subtitle)
-                
                 results.append({
-                    "title": raw_title, 
-                    "authors": auths[0] if auths else "",
-                    "narrators": s_narr, 
-                    "series": s_ser, 
-                    "part": s_part, 
-                    "summary": raw_desc, 
-                    "image": img, 
-                    "releaseDate": info.get('publishedDate') or ""
+                    "title": raw_title, "authors": auths[0] if auths else "",
+                    "narrators": s_narr, "series": s_ser, "part": s_part, 
+                    "summary": raw_desc, "image": img, "releaseDate": info.get('publishedDate') or ""
                 })
             return results
-        else:
-            st.error(f"Google Books Error: {r.status_code}")
-    except Exception as e:
-        st.error(f"Google Books Connection Error: {e}")
+        else: st.error(f"Google Error: {r.status_code}")
+    except Exception as e: st.error(f"Google Connection Error: {e}")
     return []
 
 def fetch_metadata_router(query, provider, asin=None):
@@ -337,7 +323,17 @@ def fetch_metadata_router(query, provider, asin=None):
     if provider == "Apple Books": return fetch_itunes(query)
     return fetch_google(query)
 
-# --- PROCESSING ---
+# --- PROCESSING (SMART IMPORT: LINK OR COPY) ---
+def smart_transfer(src, dst):
+    """Attempts hardlink (0 space), falls back to copy."""
+    try:
+        if os.path.exists(dst): os.unlink(dst)
+        os.link(src, dst)
+        return "Linked"
+    except OSError:
+        shutil.copy2(src, dst)
+        return "Copied"
+
 def tag_file(file_path, author, title, series, desc, cover_url, year, track_num, total_tracks):
     ext = os.path.splitext(file_path)[1].lower()
     try:
@@ -375,7 +371,9 @@ def process_selection(source_data, author, title, series, series_part, desc, cov
                 file_path = os.path.join(dest_base, filename)
                 if os.path.isfile(file_path) or os.path.islink(file_path): os.unlink(file_path)
                 elif os.path.isdir(file_path): shutil.rmtree(file_path)
-        except: pass
+        except Exception as e:
+            st.error(f"Error cleaning destination: {e}")
+            return
     else:
         clean_author = sanitize_filename(author)
         clean_title = sanitize_filename(title)
@@ -387,13 +385,14 @@ def process_selection(source_data, author, title, series, series_part, desc, cov
     total = len(files_to_process)
     pad = max(2, len(str(total)))
     
+    transfer_method = "Unknown"
     bar = st.progress(0)
     for i, src in enumerate(files_to_process):
         ext = os.path.splitext(src)[1]
         name = f"{str(i+1).zfill(pad)} - {sanitize_filename(title)}{ext}"
         dst = os.path.join(dest_base, name)
         
-        shutil.copy2(src, dst)
+        transfer_method = smart_transfer(src, dst)
             
         tag_file(dst, author, title, series, desc, cover_url, publish_year, i+1, total)
         bar.progress((i+1)/total)
@@ -417,7 +416,8 @@ def process_selection(source_data, author, title, series, series_part, desc, cov
     if source_data.get('is_manual'):
         st.session_state['manual_books'] = [b for b in st.session_state['manual_books'] if b['id'] != source_data['unique_id']]
 
-    st.success(f"✅ Success: {title}")
+    icon = "🔗" if transfer_method == "Linked" else "📋"
+    st.toast(f"{icon} {transfer_method}: {title}")
     st.cache_data.clear()
     st.session_state['current_selection_data'] = None
     time.sleep(1)
@@ -426,14 +426,12 @@ def process_selection(source_data, author, title, series, series_part, desc, cov
 # --- MAIN LAYOUT ---
 col1, col2, col3 = st.columns([1.5, 2, 1.5])
 
-# Fetch Data
 auto_processed, manual_processed = get_candidates_with_status()
 new_items = [x for x in auto_processed if x['status_code'] == 0]
 match_items = [x for x in auto_processed if x['status_code'] == 1]
 existing_items = [x for x in auto_processed if x['status_code'] == 3]
 built_items = [x for x in manual_processed]
 
-# Sync
 if st.session_state['sync_selection']:
     sync_target = st.session_state['sync_selection']
     all_known = auto_processed + manual_processed
@@ -443,15 +441,13 @@ if st.session_state['sync_selection']:
         st.toast(f"Matched: {matching[0]['name']}")
         st.session_state['sync_selection'] = None
 
-# --- COL 1: QUEUE (COMPATIBILITY MODE) ---
+# --- QUEUE (CHECKBOX MODE) ---
 def render_list(items, key_suffix):
     if not items:
         st.info("Empty")
         return
-    
     for i, item in enumerate(items):
         is_selected = (st.session_state.get('current_selection_data') == item)
-        # Use simple Checkbox to select
         if st.checkbox(f"{item['State']} {item['name']}", key=f"chk_{key_suffix}_{i}", value=is_selected):
             if not is_selected:
                 st.session_state['current_selection_data'] = item
@@ -477,7 +473,7 @@ if selected_item:
         st.session_state['last_synced_book_id'] = selected_item['unique_id']
         st.rerun()
 
-# --- COL 2: EDITOR ---
+# --- EDITOR ---
 with col2:
     if selected_item:
         st.subheader("✏️ Editor")
@@ -490,7 +486,7 @@ with col2:
             st.caption(f"Path: `{os.path.basename(selected_item['path'])}`")
             target_override = None
 
-        if st.button("❌ Close Selection"):
+        if st.button("❌ Close"):
             st.session_state['current_selection_data'] = None
             st.rerun()
             
@@ -536,7 +532,6 @@ with col2:
             sel_idx = st.selectbox("Results", range(len(opts)), format_func=lambda x: opts[x])
             force_update_form(sel_idx)
 
-        # DEBUG: Show what API returned
         with st.expander("🔍 Show Raw Data"):
             if 'search_results' in st.session_state:
                 st.json(st.session_state['search_results'])
@@ -563,7 +558,7 @@ with col2:
     else:
         st.info("👈 Select a book.")
 
-# --- COL 3: EXPLORER ---
+# --- EXPLORER ---
 with col3:
     st.subheader("📂 Explorer")
     curr_path = st.session_state['exp_path']
@@ -591,7 +586,6 @@ with col3:
                 hide_index=True, use_container_width=True, height=450,
                 on_select="rerun", selection_mode="multi-row"
             )
-            
             selected_rows = sel_files.selection.rows
             
             if selected_rows:
