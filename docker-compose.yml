@@ -1,14 +1,15 @@
 version: '3.8'
 services:
-  tidybooks:  
+  tidybooks:
     build: .
-    container_name: tidybooks  
-    network_mode: host
+    container_name: tidybooks
+    ports:
+      - "8501:8501"
     volumes:
-      - /volume1/Zack/media/downloads/Audiobooks - MAM - Seeding:/downloads:ro
-      - /volume1/Zack/media/audiobooks:/audiobooks:rw
-      - /volume2/docker/tidybooks:/app/data
-    environment:
-      - PUID=0
-      - PGID=0
+      # THE FIX: Mount the parent 'media' folder to '/data'
+      # This ensures downloads and audiobooks are on the same "drive" inside Docker
+      - /volume1/Zack/media:/data
+      
+      # Keep config separate
+      - ./data:/app/data
     restart: unless-stopped
