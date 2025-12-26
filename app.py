@@ -11,7 +11,6 @@ from mutagen.id3 import ID3, TIT2, TPE1, TALB, APIC, COMM, TRCK
 import difflib
 
 # --- Configuration ---
-# PATHS (Must match docker-compose volumes)
 DOWNLOAD_DIR = "/downloads"
 LIBRARY_DIR = "/audiobooks"
 DATA_DIR = "/app/data"
@@ -67,8 +66,9 @@ def sanitize_filename(name):
     return "Unknown" if not clean else clean
 
 def is_junk_folder(folder_name):
-    junk = ['sample', 'samples', 'extra', 'extras', 'proof', 'interview', 'interviews', '.zab', 'artwork']
-    return folder_name.lower() in junk
+    # Only hide obvious system folders, show everything else
+    junk = ['.zab', 'artwork', '@eaDir'] 
+    return folder_name.lower() in junk or folder_name.startswith('.')
 
 def clean_search_query(text):
     if not text: return ""
@@ -100,43 +100,55 @@ def scan_library_now():
 @st.cache_data(ttl=600, show_spinner="Scanning downloads...")
 def scan_downloads_snapshot():
     if not os.path.exists(DOWNLOAD_DIR): return []
+    
     candidates = []
     seen_ids = set() 
 
     for root, dirs, files in os.walk(DOWNLOAD_DIR):
         audio_files = [f for f in files if f.lower().endswith(('.mp3', '.m4b', '.m4a', '.flac'))]
+        
         if audio_files:
             folder_name = os.path.basename(root)
             if is_junk_folder(folder_name): continue
+            
             is_root = os.path.abspath(root) == os.path.abspath(DOWNLOAD_DIR)
 
-            if "collection" in folder_name.lower() or is_root:
-                groups = {}
+            # 1. LOOSE FILES IN ROOT (Simple Grouping)
+            if is_root:
+                # Group strictly by direct folder presence.
+                # If it's a file in root, we treat it as a book based on filename.
                 for f in audio_files:
                     stem = os.path.splitext(f)[0]
-                    if stem not in groups: groups[stem] = []
-                    groups[stem].append(f)
-                for stem, file_list in groups.items():
                     unique_id = f"{root}|{stem}"
                     candidates.append({
                         "id": unique_id, "path": root, "name": stem,
                         "clean": sanitize_for_matching(stem),
-                        "file_list": [os.path.join(root, x) for x in file_list], "is_group": True 
+                        "file_list": [os.path.join(root, f)], "is_group": False 
                     })
+            
+            # 2. SUBFOLDERS (One Folder = One Book)
             else:
-                has_real_subfolders = any(not d.startswith('.') for d in dirs)
-                if has_real_subfolders: continue 
                 target_path = root
                 target_name = folder_name
                 parent_path = os.path.dirname(root)
+                
+                # Check if parent is already a book (handle CD1/CD2 folders)
                 if re.match(r'^(cd|disc|part|vol|chapter)?\s*\d+$', folder_name, re.IGNORECASE):
                      if os.path.abspath(parent_path) != os.path.abspath(DOWNLOAD_DIR):
                          target_path = parent_path
                          target_name = os.path.basename(parent_path)
+
                 unique_id = f"{target_path}|FOLDER"
+                
                 if unique_id not in seen_ids:
                     seen_ids.add(unique_id)
-                    all_paths = [os.path.join(root, f) for f in audio_files]
+                    # Gather all audio recursively from this target path
+                    all_paths = []
+                    for r, _, fs in os.walk(target_path):
+                        for f in fs:
+                            if f.lower().endswith(('.mp3', '.m4b', '.m4a', '.flac')):
+                                all_paths.append(os.path.join(r, f))
+                    
                     candidates.append({
                         "id": unique_id, "path": target_path, "name": target_name,
                         "clean": sanitize_for_matching(target_name),
@@ -153,20 +165,28 @@ def calculate_matches(all_candidates, library_items, history):
         clean_dl = data['clean']
         status = 0 
         match_path = None
+        
+        # Check History
         if unique_id in history or path_str in history: status = 3
+        
+        # Check Library Match
         elif library_items:
             for lib_item in library_items:
                 clean_lib = lib_item.get('clean')
                 if not clean_lib: continue
-                if len(clean_lib) > 2 and (clean_lib in clean_dl or clean_dl in clean_lib):
+                # Simple containment check
+                if len(clean_lib) > 3 and (clean_lib in clean_dl or clean_dl in clean_lib):
                     match_path = lib_item['path']
                     status = 1
                     break
+        
         status_icon = "⚪"
         if status == 3: status_icon = "✅"
         elif status == 1: status_icon = "⚠️"
+        
         display_name = data['name']
         if data.get('is_manual'): display_name = f"🛠️ {display_name}"
+        
         final_list.append({
             "path": data['path'], "unique_id": unique_id,
             "name": display_name, "raw_name": data['name'],
@@ -327,12 +347,10 @@ def process_selection(source_data, author, title, series, series_part, desc, cov
         clean_title = sanitize_filename(title)
         
         # --- FIXED FOLDER LOGIC ---
-        # Only create a series folder if series is NOT empty
         if series and series.strip():
             clean_series = sanitize_filename(series)
             dest_base = os.path.join(LIBRARY_DIR, clean_author, clean_series, clean_title)
         else:
-            # Direct Author/Title structure
             dest_base = os.path.join(LIBRARY_DIR, clean_author, clean_title)
             
         os.makedirs(dest_base, exist_ok=True)
