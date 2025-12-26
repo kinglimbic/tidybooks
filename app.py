@@ -11,7 +11,7 @@ from mutagen.id3 import ID3, TIT2, TPE1, TALB, APIC, COMM, TRCK
 import difflib
 
 # --- Configuration ---
-# REVERTED TO ORIGINAL PATHS (Safe Mode)
+# PATHS
 DOWNLOAD_DIR = "/downloads"
 LIBRARY_DIR = "/audiobooks"
 DATA_DIR = "/app/data"
@@ -206,8 +206,7 @@ def extract_details_smart(title, desc, subtitle=""):
 
 def fetch_audnexus_direct(asin):
     if not asin: return []
-    st.session_state['search_results'] = [] # Clear old results
-    
+    st.session_state['search_results'] = []
     headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/91.0.4472.124 Safari/537.36'}
     try:
         r = requests.get(f"{AUDNEXUS_API}/{asin}", headers=headers, timeout=10)
@@ -224,10 +223,8 @@ def fetch_audnexus_direct(asin):
                 "releaseDate": b.get('releaseDate') or "",
                 "source": f"Audible ({asin})"
             }]
-        else:
-            st.toast(f"Audnexus Error: {r.status_code}")
-    except Exception as e:
-        st.toast(f"Audnexus Connection Error: {e}")
+        else: st.toast(f"Audnexus Error: {r.status_code}")
+    except Exception as e: st.toast(f"Audnexus Connection Error: {e}")
     return []
 
 def fetch_itunes(query):
@@ -283,6 +280,13 @@ def fetch_metadata_router(query, provider, asin=None):
     return fetch_google(query)
 
 # --- PROCESSING ---
+def smart_transfer(src, dst):
+    # SAFE COPY (No Hardlinks to protect seeding)
+    try:
+        shutil.copy2(src, dst)
+        return "Copied"
+    except Exception: return "Failed"
+
 def tag_file(file_path, author, title, series, desc, cover_url, year, track_num, total_tracks):
     ext = os.path.splitext(file_path)[1].lower()
     try:
@@ -312,12 +316,8 @@ def tag_file(file_path, author, title, series, desc, cover_url, year, track_num,
 
 def process_selection(source_data, author, title, series, series_part, desc, cover_url, narrator, publish_year, target_override=None):
     files_to_process = source_data['file_list']
-    
     if target_override:
-        # Merge Mode
         dest_base = target_override
-        # Warning: For safe copy, we still need to clear destination if we want a clean merge
-        # But we won't delete the SOURCE files.
         try:
             for filename in os.listdir(dest_base):
                 file_path = os.path.join(dest_base, filename)
@@ -325,7 +325,6 @@ def process_selection(source_data, author, title, series, series_part, desc, cov
                 elif os.path.isdir(file_path): shutil.rmtree(file_path)
         except: pass
     else:
-        # New Book Mode
         clean_author = sanitize_filename(author)
         clean_title = sanitize_filename(title)
         clean_series = sanitize_filename(series)
@@ -335,17 +334,13 @@ def process_selection(source_data, author, title, series, series_part, desc, cov
     files_to_process.sort()
     total = len(files_to_process)
     pad = max(2, len(str(total)))
-    
+    transfer_method = "Unknown"
     bar = st.progress(0)
     for i, src in enumerate(files_to_process):
         ext = os.path.splitext(src)[1]
         name = f"{str(i+1).zfill(pad)} - {sanitize_filename(title)}{ext}"
         dst = os.path.join(dest_base, name)
-        
-        # --- SAFE COPY (Seeding Protected) ---
-        shutil.copy2(src, dst)
-        
-        # Tag ONLY the destination file
+        transfer_method = smart_transfer(src, dst)
         tag_file(dst, author, title, series, desc, cover_url, publish_year, i+1, total)
         bar.progress((i+1)/total)
 
@@ -368,7 +363,7 @@ def process_selection(source_data, author, title, series, series_part, desc, cov
     if source_data.get('is_manual'):
         st.session_state['manual_books'] = [b for b in st.session_state['manual_books'] if b['id'] != source_data['unique_id']]
 
-    st.success(f"✅ Imported Copy: {title}")
+    st.success(f"{transfer_method}: {title}")
     st.cache_data.clear()
     st.session_state['current_selection_data'] = None
     time.sleep(1)
@@ -392,26 +387,43 @@ if st.session_state['sync_selection']:
         st.toast(f"Matched: {matching[0]['name']}")
         st.session_state['sync_selection'] = None
 
-def render_list(items, key_suffix):
+# --- SELECT CALLBACK ---
+def update_selection(item):
+    # This makes the checkboxes behave like radio buttons across tabs
+    # When this callback runs, it means the user toggled a specific checkbox
+    # We check the NEW state by looking at the key
+    key = f"chk_{item['unique_id']}"
+    if st.session_state.get(key, False):
+        st.session_state['current_selection_data'] = item
+    else:
+        # User unchecked the item
+        if st.session_state['current_selection_data'] == item:
+            st.session_state['current_selection_data'] = None
+
+def render_list(items):
     if not items:
         st.info("Empty")
         return
-    for i, item in enumerate(items):
+    for item in items:
+        # Determine if this specific item is the active one
         is_selected = (st.session_state.get('current_selection_data') == item)
-        if st.checkbox(f"{item['State']} {item['name']}", key=f"chk_{key_suffix}_{i}", value=is_selected):
-            if not is_selected:
-                st.session_state['current_selection_data'] = item
-                st.rerun()
-        elif is_selected:
-            st.session_state['current_selection_data'] = None
-            st.rerun()
+        # Use a unique key based on the book ID
+        key = f"chk_{item['unique_id']}"
+        # Trigger the callback on change
+        st.checkbox(
+            f"{item['State']} {item['name']}", 
+            key=key, 
+            value=is_selected, 
+            on_change=update_selection, 
+            args=(item,)
+        )
 
 with col1:
     tab_new, tab_built, tab_match, tab_exist = st.tabs(["Untidy", "Built", "Match", "Done"])
-    with tab_new: render_list(new_items, "new")
-    with tab_built: render_list(built_items, "built")
-    with tab_match: render_list(match_items, "match")
-    with tab_exist: render_list(existing_items, "done")
+    with tab_new: render_list(new_items)
+    with tab_built: render_list(built_items)
+    with tab_match: render_list(match_items)
+    with tab_exist: render_list(existing_items)
 
 selected_item = st.session_state.get('current_selection_data')
 if selected_item:
