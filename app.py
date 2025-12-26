@@ -11,6 +11,7 @@ from mutagen.mp4 import MP4, MP4Cover
 from mutagen.id3 import ID3, TIT2, TPE1, TALB, APIC, COMM, TRCK
 
 # --- Configuration ---
+# PATHS
 DOWNLOAD_DIR = "/downloads"
 LIBRARY_DIR = "/audiobooks"
 DATA_DIR = "/app/data"
@@ -21,8 +22,6 @@ ITUNES_API = "https://itunes.apple.com/search"
 GOOGLE_BOOKS_API = "https://www.googleapis.com/books/v1/volumes"
 
 os.makedirs(DATA_DIR, exist_ok=True)
-CACHE_FILE = os.path.join(DATA_DIR, "library_cache.json")
-
 st.set_page_config(page_title="TidyBooks", layout="wide", page_icon="📚")
 
 # --- Session State ---
@@ -47,7 +46,7 @@ def normalize_text(text):
     """Simplifies text for fuzzy matching"""
     if not text: return ""
     text = text.lower()
-    text = re.sub(r'\b(audiobook|mp3|m4b)\b', '', text)
+    text = re.sub(r'\b(audiobook|mp3|m4b|m4a|flac)\b', '', text)
     text = re.sub(r'[^a-z0-9]', '', text) 
     return text
 
@@ -65,13 +64,10 @@ def get_audio_files_recursive(path_list):
                         found_files.append(os.path.join(root, f))
     return sorted(found_files)
 
-# --- Library Scanning (Duplicate Detection) ---
-@st.cache_data(ttl=300) # Cache for 5 mins
+# --- Library Scanning (The "Brain") ---
+@st.cache_data(ttl=300)
 def scan_library():
-    """
-    Scans /audiobooks to find existing books.
-    Assumes structure: Author/Series/Book OR Author/Book
-    """
+    """Scans /audiobooks to find what you already have."""
     known_books = []
     if not os.path.exists(LIBRARY_DIR): return []
 
@@ -83,35 +79,53 @@ def scan_library():
             item_path = os.path.join(auth_path, item)
             if not os.path.isdir(item_path): continue
             
-            # Check if this is a Series folder (contains subfolders) or a Book folder
+            # Check if Series (contains subfolders) or Book
             sub_dirs = [d for d in os.listdir(item_path) if os.path.isdir(os.path.join(item_path, d))]
             
             if sub_dirs:
-                # It's a Series! Add the subfolders as books
                 for book in sub_dirs:
                     known_books.append({
                         "title": book,
-                        "series": item,
                         "author": author,
                         "norm": normalize_text(book)
                     })
             else:
-                # It's a Book!
                 known_books.append({
                     "title": item,
-                    "series": None,
                     "author": author,
                     "norm": normalize_text(item)
                 })
     return known_books
 
-def check_duplicate(title, known_books):
+def check_duplicate_strict(title, known_books):
+    """Checks if a title exists in the library."""
     norm_title = normalize_text(title)
+    if len(norm_title) < 4: return None
+    
     for b in known_books:
-        # Exact match or very high fuzzy match
+        # Exact match or high fuzzy match
         if norm_title == b['norm'] or (len(norm_title) > 5 and norm_title in b['norm']):
             return b
     return None
+
+def check_folder_content_status(folder_path, known_books):
+    """
+    Peeks inside a download folder. 
+    If the files inside match a known book, returns that book.
+    """
+    try:
+        # Get first few audio files
+        files = [f for f in os.listdir(folder_path) if f.lower().endswith(('.mp3','.m4b','.m4a'))]
+        if not files: return None
+        
+        # Use the first file to guess
+        stem = os.path.splitext(files[0])[0]
+        # Clean common prefixes like "01 - " or "Chapter 1"
+        clean_stem = re.sub(r'^(\d+[-_\s]+|chapter\s+\d+\s+)', '', stem, flags=re.IGNORECASE)
+        
+        return check_duplicate_strict(clean_stem, known_books)
+    except:
+        return None
 
 # --- Metadata APIs ---
 def extract_details_smart(title, desc, subtitle=""):
@@ -167,8 +181,7 @@ def fetch_metadata(query, provider, asin=None):
                         "narrators": s_narr, "series": s_ser, "part": s_part, 
                         "summary": info.get('description'), "image": img, "releaseDate": info.get('publishedDate')
                     })
-    except Exception as e:
-        st.error(f"Search Error: {e}")
+    except Exception as e: st.error(f"Search Error: {e}")
     return results
 
 # --- Import Logic ---
@@ -239,7 +252,7 @@ def perform_import(file_list, meta):
         json.dump(abs_meta, f, indent=4)
 
     st.success(f"✅ Imported: {meta['form_title']}")
-    st.cache_data.clear() # Clear cache so new book shows up immediately
+    st.cache_data.clear()
     time.sleep(2)
     st.session_state['draft_files'] = []
     st.session_state['search_results'] = []
@@ -254,10 +267,13 @@ known_books = scan_library()
 with col1:
     st.subheader("📂 Download Browser")
     curr = st.session_state['exp_path']
-    if st.button("⬆️ Up Directory", use_container_width=True):
-        st.session_state['exp_path'] = os.path.dirname(curr)
-        st.rerun()
-    st.caption(curr)
+    
+    c_nav1, c_nav2 = st.columns([0.2, 0.8])
+    with c_nav1:
+        if st.button("⬆️ Up"):
+            st.session_state['exp_path'] = os.path.dirname(curr)
+            st.rerun()
+    with c_nav2: st.caption(curr)
 
     try:
         items = sorted(os.listdir(curr))
@@ -268,20 +284,29 @@ with col1:
             
             st.markdown("**Folders**")
             folders = [i for i in items if os.path.isdir(os.path.join(curr, i))]
+            
             for f in folders:
-                # Check for duplicate
-                dup = check_duplicate(f, known_books)
-                icon = "✅" if dup else "📁"
+                full_path = os.path.join(curr, f)
+                
+                # 1. Check folder name itself
+                dup = check_duplicate_strict(f, known_books)
+                
+                # 2. If no match, check contents (Deep Scan)
+                if not dup:
+                    dup = check_folder_content_status(full_path, known_books)
+
+                # Icon Logic: 📚 = Imported, 📁 = New
+                icon = "📚" if dup else "📁"
+                label = f"{icon} {f}"
+                if dup: label += f" (in Lib)"
                 
                 c1, c2 = st.columns([0.8, 0.2])
                 with c1:
-                    label = f"{icon} {f}"
-                    if dup: label += f" (in Library)"
                     if st.checkbox(label, key=f"d_{f}"):
-                        selected_items.append(os.path.join(curr, f))
+                        selected_items.append(full_path)
                 with c2:
-                    if st.form_submit_button(f"Open", key=f"btn_{f}", type="secondary"):
-                        st.session_state['exp_path'] = os.path.join(curr, f)
+                    if st.form_submit_button("Open", key=f"btn_{f}", type="secondary"):
+                        st.session_state['exp_path'] = full_path
                         st.rerun()
 
             st.markdown("**Files**")
@@ -290,7 +315,11 @@ with col1:
             
             if not audio_files: st.caption("No audio files.")
             for f in audio_files:
-                if st.checkbox(f"🎵 {f}", key=f"f_{f}"):
+                stem = os.path.splitext(f)[0]
+                dup = check_duplicate_strict(stem, known_books)
+                icon = "📚" if dup else "🎵"
+                
+                if st.checkbox(f"{icon} {f}", key=f"f_{f}"):
                     selected_items.append(os.path.join(curr, f))
 
             st.markdown("---")
@@ -363,20 +392,18 @@ with col2:
             img = st.text_input("Cover URL", key='form_img')
             if img: st.image(img, width=150)
 
-            # --- DUPLICATE CHECK ON SUBMIT ---
             st.markdown("---")
             submitted = st.form_submit_button("🚀 Import Book", type="primary", use_container_width=True)
             
             if submitted:
                 if auth and titl:
-                    # Check library again before confirming
-                    dup = check_duplicate(titl, known_books)
+                    # Final Check
+                    dup = check_duplicate_strict(titl, known_books)
                     if dup and not st.session_state.get('confirm_overwrite'):
-                        st.warning(f"⚠️ Duplicate Found!\n\nLibrary already has: **{dup['title']}** by **{dup['author']}**.")
+                        st.warning(f"⚠️ Duplicate Found in Library!\n\n**{dup['title']}** by **{dup['author']}**")
                         st.session_state['confirm_overwrite'] = True
                         st.rerun()
                     else:
-                        # Proceed
                         meta = {
                             'form_auth': auth, 'form_title': titl, 'form_narr': narr,
                             'form_series': seri, 'form_part': part, 'form_year': year,
@@ -386,7 +413,7 @@ with col2:
                 else:
                     st.error("Author/Title Required.")
 
-        # Confirmation Button (Outside Form)
+        # Confirmation Button
         if st.session_state.get('confirm_overwrite'):
             st.write("")
             col_warn, col_ok = st.columns([3, 1])
