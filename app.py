@@ -11,7 +11,7 @@ from mutagen.id3 import ID3, TIT2, TPE1, TALB, APIC, COMM, TRCK
 import difflib
 
 # --- Configuration ---
-# PATHS
+# PATHS (Must match docker-compose volumes)
 DOWNLOAD_DIR = "/downloads"
 LIBRARY_DIR = "/audiobooks"
 DATA_DIR = "/app/data"
@@ -108,7 +108,6 @@ def scan_downloads_snapshot():
         if audio_files:
             folder_name = os.path.basename(root)
             if is_junk_folder(folder_name): continue
-            
             is_root = os.path.abspath(root) == os.path.abspath(DOWNLOAD_DIR)
 
             if "collection" in folder_name.lower() or is_root:
@@ -117,7 +116,6 @@ def scan_downloads_snapshot():
                     stem = os.path.splitext(f)[0]
                     if stem not in groups: groups[stem] = []
                     groups[stem].append(f)
-                
                 for stem, file_list in groups.items():
                     unique_id = f"{root}|{stem}"
                     candidates.append({
@@ -281,7 +279,7 @@ def fetch_metadata_router(query, provider, asin=None):
 
 # --- PROCESSING ---
 def smart_transfer(src, dst):
-    # SAFE COPY (No Hardlinks to protect seeding)
+    # SAFE COPY (No Hardlinks)
     try:
         shutil.copy2(src, dst)
         return "Copied"
@@ -327,8 +325,16 @@ def process_selection(source_data, author, title, series, series_part, desc, cov
     else:
         clean_author = sanitize_filename(author)
         clean_title = sanitize_filename(title)
-        clean_series = sanitize_filename(series)
-        dest_base = os.path.join(LIBRARY_DIR, clean_author, clean_series, clean_title) if clean_series else os.path.join(LIBRARY_DIR, clean_author, clean_title)
+        
+        # --- FIXED FOLDER LOGIC ---
+        # Only create a series folder if series is NOT empty
+        if series and series.strip():
+            clean_series = sanitize_filename(series)
+            dest_base = os.path.join(LIBRARY_DIR, clean_author, clean_series, clean_title)
+        else:
+            # Direct Author/Title structure
+            dest_base = os.path.join(LIBRARY_DIR, clean_author, clean_title)
+            
         os.makedirs(dest_base, exist_ok=True)
 
     files_to_process.sort()
@@ -387,43 +393,26 @@ if st.session_state['sync_selection']:
         st.toast(f"Matched: {matching[0]['name']}")
         st.session_state['sync_selection'] = None
 
-# --- SELECT CALLBACK ---
-def update_selection(item):
-    # This makes the checkboxes behave like radio buttons across tabs
-    # When this callback runs, it means the user toggled a specific checkbox
-    # We check the NEW state by looking at the key
-    key = f"chk_{item['unique_id']}"
-    if st.session_state.get(key, False):
-        st.session_state['current_selection_data'] = item
-    else:
-        # User unchecked the item
-        if st.session_state['current_selection_data'] == item:
-            st.session_state['current_selection_data'] = None
-
-def render_list(items):
+def render_list(items, key_suffix):
     if not items:
         st.info("Empty")
         return
-    for item in items:
-        # Determine if this specific item is the active one
+    for i, item in enumerate(items):
         is_selected = (st.session_state.get('current_selection_data') == item)
-        # Use a unique key based on the book ID
-        key = f"chk_{item['unique_id']}"
-        # Trigger the callback on change
-        st.checkbox(
-            f"{item['State']} {item['name']}", 
-            key=key, 
-            value=is_selected, 
-            on_change=update_selection, 
-            args=(item,)
-        )
+        if st.checkbox(f"{item['State']} {item['name']}", key=f"chk_{key_suffix}_{i}", value=is_selected):
+            if not is_selected:
+                st.session_state['current_selection_data'] = item
+                st.rerun()
+        elif is_selected:
+            st.session_state['current_selection_data'] = None
+            st.rerun()
 
 with col1:
     tab_new, tab_built, tab_match, tab_exist = st.tabs(["Untidy", "Built", "Match", "Done"])
-    with tab_new: render_list(new_items)
-    with tab_built: render_list(built_items)
-    with tab_match: render_list(match_items)
-    with tab_exist: render_list(existing_items)
+    with tab_new: render_list(new_items, "new")
+    with tab_built: render_list(built_items, "built")
+    with tab_match: render_list(match_items, "match")
+    with tab_exist: render_list(existing_items, "done")
 
 selected_item = st.session_state.get('current_selection_data')
 if selected_item:
