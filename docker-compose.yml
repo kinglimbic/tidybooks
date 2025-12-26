@@ -1,15 +1,21 @@
 version: '3.8'
+
 services:
   tidybooks:
-    build: .
+    # 'build: .' tells Portainer to build the Dockerfile from this repo
+    build: . 
     container_name: tidybooks
     ports:
       - "8501:8501"
     volumes:
-      # THE FIX: Mount the parent 'media' folder to '/data'
-      # This ensures downloads and audiobooks are on the same "drive" inside Docker
-      - /volume1/Zack/media:/data
-      
-      # Keep config separate
-      - /volume2/docker/tidybooks:/app/data
+      # 1. MEDIA FOLDERS (Safe Mode Mappings)
+      # These must match the paths we set in app.py
+      - /volume1/Zack/media/downloads:/downloads
+      - /volume1/Zack/media/audiobooks:/audiobooks
+
+      # 2. DATA PERSISTENCE
+      # We map a physical folder on your NAS to save the database/logs.
+      # If we don't do this, you lose your history every time you update the app.
+      - /volume2/docker/tidybooks/:/app/data
+
     restart: unless-stopped
