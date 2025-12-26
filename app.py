@@ -11,9 +11,9 @@ from mutagen.id3 import ID3, TIT2, TPE1, TALB, APIC, COMM, TRCK
 import difflib
 
 # --- Configuration ---
-# SYNOLOGY PATHS (Must match your docker-compose volumes)
-DOWNLOAD_DIR = "/data/downloads"
-LIBRARY_DIR = "/data/audiobooks"
+# REVERTED TO ORIGINAL PATHS (Safe Mode)
+DOWNLOAD_DIR = "/downloads"
+LIBRARY_DIR = "/audiobooks"
 DATA_DIR = "/app/data"
 HISTORY_FILE = os.path.join(DATA_DIR, "processed_log.json")
 CACHE_FILE = os.path.join(DATA_DIR, "library_map_cache.json")
@@ -114,7 +114,7 @@ def scan_downloads_snapshot():
             if "collection" in folder_name.lower() or is_root:
                 groups = {}
                 for f in audio_files:
-                    stem = os.path.splitext(f)[0] # Simple grouping
+                    stem = os.path.splitext(f)[0]
                     if stem not in groups: groups[stem] = []
                     groups[stem].append(f)
                 
@@ -193,36 +193,26 @@ def extract_details_smart(title, desc, subtitle=""):
     desc = desc or ""
     subtitle = subtitle or ""
     full_text = f"{title} {subtitle} {desc}"
-    
     match_narr = re.search(r"(?:narrated|read)\s+by\s+([A-Za-z\s\.]+?)(?:[\.,\n\(-]|$)", full_text, re.IGNORECASE)
     if match_narr: narrator = match_narr.group(1).strip()
-
     if ":" in title:
         split_title = title.split(":")
         if len(split_title[0]) > 3: series = split_title[0].strip()
-
     match_series_b = re.search(r"\(([^)]+?)(?:,|#|;)\s*(?:Book|Vol|Part)?\s*(\d+)\)", title, re.IGNORECASE)
     if match_series_b:
         series = match_series_b.group(1).strip()
         part = match_series_b.group(2).strip()
     return narrator, series, part
 
-def fetch_audnexus_direct(asin_raw):
-    # Regex to extract strict ASIN (B0...) just in case URL is pasted
-    match = re.search(r'(B0[A-Z0-9]{8})', asin_raw)
-    if not match:
-        st.error("Invalid ASIN format. Must contain 'B0...'.")
-        return []
-    asin = match.group(1)
+def fetch_audnexus_direct(asin):
+    if not asin: return []
+    st.session_state['search_results'] = [] # Clear old results
     
-    st.info(f"📡 Querying Audnexus for ASIN: {asin}...")
-    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
-    
+    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/91.0.4472.124 Safari/537.36'}
     try:
         r = requests.get(f"{AUDNEXUS_API}/{asin}", headers=headers, timeout=10)
         if r.status_code == 200:
             b = r.json()
-            st.success("✅ Match found via Audnexus!")
             return [{
                 "title": b.get('title') or "",
                 "authors": ", ".join(b.get('authors', [])) or "",
@@ -234,53 +224,45 @@ def fetch_audnexus_direct(asin_raw):
                 "releaseDate": b.get('releaseDate') or "",
                 "source": f"Audible ({asin})"
             }]
-        elif r.status_code == 404:
-            st.error(f"❌ Audnexus: Book ID {asin} not found.")
         else:
-            st.error(f"❌ Audnexus Error: {r.status_code}")
+            st.toast(f"Audnexus Error: {r.status_code}")
     except Exception as e:
-        st.error(f"❌ Network Error: {e}")
+        st.toast(f"Audnexus Connection Error: {e}")
     return []
 
 def fetch_itunes(query):
-    st.info(f"📡 Searching Apple Books for: '{query}'...")
+    st.session_state['search_results'] = []
     try:
         r = requests.get(ITUNES_API, params={'term': query, 'media': 'audiobook', 'limit': 10}, timeout=10)
         if r.status_code == 200:
             data = r.json()
-            count = data.get('resultCount', 0)
-            if count == 0: st.warning("Apple Books returned 0 results.")
-            else: st.success(f"✅ Found {count} results from Apple Books.")
-            
             results = []
             for item in data.get('results', []):
-                s_narr, s_ser, s_part = extract_details_smart(item.get('collectionName'), item.get('description'))
+                img = item.get('artworkUrl100', '').replace('100x100', '600x600')
+                raw_title = item.get('collectionName') or ""
+                raw_desc = item.get('description') or ""
+                s_narr, s_ser, s_part = extract_details_smart(raw_title, raw_desc)
                 results.append({
-                    "title": item.get('collectionName') or "",
-                    "authors": item.get('artistName') or "",
+                    "title": raw_title, "authors": item.get('artistName') or "",
                     "narrators": s_narr, "series": s_ser, "part": s_part, 
-                    "summary": item.get('description') or "",
-                    "image": item.get('artworkUrl100', '').replace('100x100', '600x600'),
-                    "releaseDate": item.get('releaseDate') or ""
+                    "summary": raw_desc, "image": img, "releaseDate": item.get('releaseDate') or ""
                 })
             return results
-        else: st.error(f"Apple Error: {r.status_code}")
-    except Exception as e: st.error(f"Connection Error: {e}")
+        else: st.toast(f"Apple Error: {r.status_code}")
+    except Exception as e: st.toast(f"Apple Connection Error: {e}")
     return []
 
 def fetch_google(query):
-    st.info(f"📡 Searching Google Books for: '{query}'...")
+    st.session_state['search_results'] = []
     try:
         r = requests.get(GOOGLE_BOOKS_API, params={"q": query, "maxResults": 10, "langRestrict": "en"}, timeout=10)
         if r.status_code == 200:
             data = r.json()
-            if 'items' not in data: st.warning("Google Books returned 0 results.")
-            else: st.success(f"✅ Found results from Google.")
-            
             results = []
             for item in data.get('items', []):
                 info = item.get('volumeInfo', {})
-                img = info.get('imageLinks', {}).get('thumbnail', '').replace('http:', 'https:')
+                img_links = info.get('imageLinks') or {}
+                img = img_links.get('thumbnail', '').replace('http:', 'https:')
                 auths = info.get('authors') or []
                 s_narr, s_ser, s_part = extract_details_smart(info.get('title'), info.get('description'), info.get('subtitle'))
                 results.append({
@@ -291,8 +273,8 @@ def fetch_google(query):
                     "image": img, "releaseDate": info.get('publishedDate') or ""
                 })
             return results
-        else: st.error(f"Google Error: {r.status_code}")
-    except Exception as e: st.error(f"Connection Error: {e}")
+        else: st.toast(f"Google Error: {r.status_code}")
+    except Exception as e: st.toast(f"Google Connection Error: {e}")
     return []
 
 def fetch_metadata_router(query, provider, asin=None):
@@ -301,15 +283,6 @@ def fetch_metadata_router(query, provider, asin=None):
     return fetch_google(query)
 
 # --- PROCESSING ---
-def smart_transfer(src, dst):
-    try:
-        if os.path.exists(dst): os.unlink(dst)
-        os.link(src, dst)
-        return "Linked"
-    except OSError:
-        shutil.copy2(src, dst)
-        return "Copied"
-
 def tag_file(file_path, author, title, series, desc, cover_url, year, track_num, total_tracks):
     ext = os.path.splitext(file_path)[1].lower()
     try:
@@ -339,8 +312,12 @@ def tag_file(file_path, author, title, series, desc, cover_url, year, track_num,
 
 def process_selection(source_data, author, title, series, series_part, desc, cover_url, narrator, publish_year, target_override=None):
     files_to_process = source_data['file_list']
+    
     if target_override:
+        # Merge Mode
         dest_base = target_override
+        # Warning: For safe copy, we still need to clear destination if we want a clean merge
+        # But we won't delete the SOURCE files.
         try:
             for filename in os.listdir(dest_base):
                 file_path = os.path.join(dest_base, filename)
@@ -348,6 +325,7 @@ def process_selection(source_data, author, title, series, series_part, desc, cov
                 elif os.path.isdir(file_path): shutil.rmtree(file_path)
         except: pass
     else:
+        # New Book Mode
         clean_author = sanitize_filename(author)
         clean_title = sanitize_filename(title)
         clean_series = sanitize_filename(series)
@@ -358,13 +336,16 @@ def process_selection(source_data, author, title, series, series_part, desc, cov
     total = len(files_to_process)
     pad = max(2, len(str(total)))
     
-    transfer_method = "Unknown"
     bar = st.progress(0)
     for i, src in enumerate(files_to_process):
         ext = os.path.splitext(src)[1]
         name = f"{str(i+1).zfill(pad)} - {sanitize_filename(title)}{ext}"
         dst = os.path.join(dest_base, name)
-        transfer_method = smart_transfer(src, dst)
+        
+        # --- SAFE COPY (Seeding Protected) ---
+        shutil.copy2(src, dst)
+        
+        # Tag ONLY the destination file
         tag_file(dst, author, title, series, desc, cover_url, publish_year, i+1, total)
         bar.progress((i+1)/total)
 
@@ -387,7 +368,7 @@ def process_selection(source_data, author, title, series, series_part, desc, cov
     if source_data.get('is_manual'):
         st.session_state['manual_books'] = [b for b in st.session_state['manual_books'] if b['id'] != source_data['unique_id']]
 
-    st.success(f"{transfer_method}: {title}")
+    st.success(f"✅ Imported Copy: {title}")
     st.cache_data.clear()
     st.session_state['current_selection_data'] = None
     time.sleep(1)
@@ -411,7 +392,6 @@ if st.session_state['sync_selection']:
         st.toast(f"Matched: {matching[0]['name']}")
         st.session_state['sync_selection'] = None
 
-# --- QUEUE (CHECKBOX) ---
 def render_list(items, key_suffix):
     if not items:
         st.info("Empty")
@@ -442,7 +422,6 @@ if selected_item:
         st.session_state['last_synced_book_id'] = selected_item['unique_id']
         st.rerun()
 
-# --- EDITOR ---
 with col2:
     if selected_item:
         st.subheader("✏️ Editor")
@@ -457,15 +436,15 @@ with col2:
             st.session_state['current_selection_data'] = None
             st.rerun()
             
-        clean_q = clean_search_query(selected_item['name'])
-        q = st.text_input("Title Search", value=clean_q)
+        if 'search_input' not in st.session_state: st.session_state['search_input'] = clean_search_query(selected_item['name'])
+        q = st.text_input("Search", key="search_input")
         
         c1, c2 = st.columns([1,1])
         with c1: 
             provider = st.selectbox("Provider", ["Apple Books", "Google Books"])
             do_text = st.button("🔍 Search Text")
         with c2:
-            asin_in = st.text_input("Audible ASIN (e.g. B01N...)", value="")
+            asin_in = st.text_input("Audible ASIN", placeholder="B0...")
             do_asin = st.button("🆔 Lookup ASIN")
 
         def update_form(data):
@@ -480,21 +459,31 @@ with col2:
             st.session_state['form_img'] = data.get('image') or ''
 
         if do_text:
-            res = fetch_metadata_router(q, provider)
-            if res:
-                st.session_state['search_results'] = res
-                update_form(res[0])
+            with st.spinner(f"Searching {provider}..."):
+                st.session_state['search_results'] = [] 
+                res = fetch_metadata_router(q, provider)
+                if res:
+                    st.session_state['search_results'] = res
+                    update_form(res[0])
+                else: st.warning("No matches.")
         
         if do_asin and asin_in:
-            res = fetch_audnexus_direct(asin_in)
-            if res:
-                st.session_state['search_results'] = res
-                update_form(res[0])
+            with st.spinner("Fetching ASIN..."):
+                st.session_state['search_results'] = [] 
+                res = fetch_audnexus_direct(asin_in.strip())
+                if res:
+                    st.session_state['search_results'] = res
+                    update_form(res[0])
+                else: st.warning("ASIN not found.")
 
         if 'search_results' in st.session_state and st.session_state['search_results']:
             opts = [f"{b.get('authors')} - {b.get('title')}" for b in st.session_state['search_results']]
-            sel_idx = st.selectbox("Results", range(len(opts)), format_func=lambda x: opts[x])
+            sel_idx = st.selectbox("Select Match:", range(len(opts)), format_func=lambda x: opts[x], key=f"res_{len(opts)}")
             update_form(st.session_state['search_results'][sel_idx])
+
+        with st.expander("🔍 Debug Info"):
+            if 'search_results' in st.session_state:
+                st.json(st.session_state['search_results'])
 
         with st.form("main"):
             c1, c2 = st.columns(2)
@@ -540,6 +529,5 @@ with col3:
         
         if file_list:
             df_files = pd.DataFrame(file_list)
-            # Standard dataframe for manual builder
             st.dataframe(df_files[['icon', 'name']], hide_index=True, use_container_width=True, height=450)
     except Exception as e: st.error(f"Error: {e}")
