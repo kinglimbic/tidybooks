@@ -2,3 +2,4 @@ streamlit
 requests
 mutagen
 watchdog
+pandas
