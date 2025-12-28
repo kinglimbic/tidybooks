@@ -83,7 +83,7 @@ class MetadataEditor(tk.Toplevel):
         btn_frame.pack(fill=tk.X, side=tk.BOTTOM)
         
         tk.Button(btn_frame, text="Cancel", command=self.destroy).pack(side=tk.LEFT, padx=20)
-        tk.Button(btn_frame, text="CONFIRM IMPORT", bg="#d9fdd3", font=("Arial", 10, "bold"), 
+        tk.Button(btn_frame, text="CONFIRM & COPY", bg="#d9fdd3", font=("Arial", 10, "bold"), 
                   command=self.run_import).pack(side=tk.RIGHT, padx=20)
 
     def run_import(self):
@@ -115,11 +115,12 @@ class MetadataEditor(tk.Toplevel):
                 if os.path.exists(dest_path):
                      errors.append(f"SKIPPED (Exists): {new_folder_name}")
                 else:
-                    # Perform Copy
+                    # Perform Copy (Standard Duplication)
                     if os.path.isdir(src_path):
                         shutil.copytree(src_path, dest_path)
                     else:
-                        os.makedirs(dest_path, exist_ok=True)
+                        # Ensure parent folder exists for single files
+                        os.makedirs(os.path.dirname(dest_path), exist_ok=True)
                         shutil.copy2(src_path, dest_path)
                     
                     success_count += 1
@@ -212,4 +213,30 @@ class AudiobookImporter(tk.Tk):
                 var = tk.IntVar()
                 chk = tk.Checkbutton(self.scrollable_frame, text=item, variable=var, bg="white", anchor="w")
                 chk.pack(fill=tk.X, padx=5, pady=2)
-                self.file_vars[full_path
+                self.file_vars[full_path] = var
+                
+        except Exception as e:
+            messagebox.showerror("Error", f"Could not read directory:\n{e}")
+
+    def select_all(self):
+        for var in self.file_vars.values():
+            var.set(1)
+
+    def deselect_all(self):
+        for var in self.file_vars.values():
+            var.set(0)
+
+    # --- UPDATED: Opens the Metadata Editor instead of direct copy ---
+    def open_editor(self):
+        selected_files = [path for path, var in self.file_vars.items() if var.get() == 1]
+        
+        if not selected_files:
+            messagebox.showwarning("No Selection", "Please select at least one folder/book to import.")
+            return
+
+        # Pass the selected files to the new Editor Window
+        MetadataEditor(self, selected_files)
+
+if __name__ == "__main__":
+    app = AudiobookImporter()
+    app.mainloop()
