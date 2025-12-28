@@ -10,8 +10,7 @@ services:
     volumes:
       # 1. MEDIA FOLDERS (Safe Mode Mappings)
       # These must match the paths we set in app.py
-      - /volume1/Zack/media/downloads:/downloads
-      - /volume1/Zack/media/audiobooks:/audiobooks
+      - /volume1/Zack/media:/volume1/Zack/media
 
       # 2. DATA PERSISTENCE
       # We map a physical folder on your NAS to save the database/logs.
